@@ -1,0 +1,15 @@
+{
+  "competitor": "strathberry",
+  "url": "https://www.strathberry.com/",
+  "timestamp": "2026-09-22T08:22:21.309Z",
+  "viewport": {
+    "width": 390,
+    "height": 844,
+    "deviceScaleFactor": 3,
+    "isMobile": true,
+    "label": "390x844 mobile (iPhone 12/13-class)"
+  },
+  "screenshotPath": null,
+  "success": false,
+  "error": "Processed image is too large for the WebP format"
+}
