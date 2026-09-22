@@ -1,15 +1,17 @@
 {
   "competitor": "strathberry",
   "url": "https://www.strathberry.com/",
-  "timestamp": "2026-09-22T08:22:21.309Z",
+  "timestamp": "2026-09-22T09:04:09.390Z",
   "viewport": {
     "width": 390,
     "height": 844,
-    "deviceScaleFactor": 3,
+    "deviceScaleFactor": 1,
     "isMobile": true,
-    "label": "390x844 mobile (iPhone 12/13-class)"
+    "label": "390x844 mobile (iPhone-class CSS viewport, 1x)"
   },
-  "screenshotPath": null,
-  "success": false,
-  "error": "Processed image is too large for the WebP format"
+  "screenshotPaths": [
+    "public/captures/strathberry/2026-09-22/mobile-homepage.webp"
+  ],
+  "success": true,
+  "error": null
 }
