@@ -3,6 +3,7 @@ import path from "node:path";
 import { chromium } from "playwright";
 import sharp from "sharp";
 import { dismissCookieConsent, type ConsentStatus } from "./lib/consent";
+import { confirmUkRegion, type RegionStatus } from "./lib/region";
 
 const COMPETITOR = "strathberry";
 const TARGET_URL = "https://www.strathberry.com/";
@@ -36,6 +37,9 @@ type CaptureRecord = {
   };
   screenshotPaths: string[];
   consentStatus: ConsentStatus | null;
+  regionStatus: RegionStatus | null;
+  detectedStore: string | null;
+  detectedCurrency: string | null;
   success: boolean;
   error: string | null;
 };
@@ -127,6 +131,9 @@ async function main() {
     viewport: VIEWPORT,
     screenshotPaths: [],
     consentStatus: null,
+    regionStatus: null,
+    detectedStore: null,
+    detectedCurrency: null,
     success: false,
     error: null,
   };
@@ -152,6 +159,10 @@ async function main() {
 
     const consentStatus = await dismissCookieConsent(page);
     record = { ...record, consentStatus };
+
+    const { regionStatus, detectedStore, detectedCurrency } =
+      await confirmUkRegion(page);
+    record = { ...record, regionStatus, detectedStore, detectedCurrency };
 
     await scrollThroughPage(page);
 
