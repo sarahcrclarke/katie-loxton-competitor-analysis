@@ -6,27 +6,54 @@ const OVERLAY_MARK_ATTR = "data-kl-consent-overlay";
 const REJECT_MARK_ATTR = "data-kl-consent-reject";
 const ACCEPT_MARK_ATTR = "data-kl-consent-accept";
 
-// Strong, specific cookie/privacy consent phrases (regex *sources* — plain
-// strings, no literal RegExp objects — so the same list can be handed into
-// browser-executed code below). Deliberately multi-word/specific rather
-// than bare "cookies" or "privacy": a footer link reading just "Privacy"
-// must never be mistaken for a consent overlay.
-const COOKIE_SIGNAL_SOURCES = [
-  "cookie policy",
-  "cookie preferences",
-  "cookie settings",
-  "manage cookies",
+// STRONG evidence: actual consent-INTERACTION wording (a button/control
+// label, or body copy describing the act of consenting) that only appears
+// inside a real consent prompt — never in ordinary footer/legal nav. At
+// least one strong match is *required* before any element can become the
+// consent container (regex *sources* — plain strings, no literal RegExp
+// objects — so the same list can be handed into browser-executed code
+// below).
+const COOKIE_STRONG_SIGNAL_SOURCES = [
   "accept all cookies",
+  "accept all",
+  "allow all cookies",
+  "allow all",
   "reject all cookies",
+  "reject all",
+  "decline all",
+  "cookie settings",
+  "cookies settings",
+  "cookie preferences",
+  "manage cookies",
+  "manage preferences",
+  "manage cookie preferences",
+  "necessary cookies only",
+  "only necessary",
+  "continue without accepting",
   "storing of cookies",
   "cookies on your device",
   "tracking technologies",
-  "use of cookies",
   "we use cookies",
   "this (?:website|site) uses cookies",
-  "necessary cookies",
-  "non-essential cookies",
+  "use of cookies",
+];
+
+// WEAK evidence: generic legal/footer wording ("Privacy Policy", "Cookie
+// Policy", "Cookies", "Terms of Service", "Modern Slavery Statement", ...)
+// that legitimately appears in ordinary site footers and must NEVER by
+// itself establish a consent container — a footer nav full of these links
+// is not a cookie banner. Only used to enrich diagnostics for an element
+// that a strong match already qualified.
+const COOKIE_WEAK_SIGNAL_SOURCES = [
+  "cookie policy",
+  "cookies policy",
   "privacy policy",
+  "privacy notice",
+  "terms of service",
+  "terms and conditions",
+  "modern slavery statement",
+  "cookies",
+  "privacy",
 ];
 
 // Fragments matched against a candidate control's accessible name
@@ -82,18 +109,28 @@ const clearMarksFn = new Function(
   `
 ) as unknown as BrowserFn<string, void>;
 
-type OverlayCandidateArgs = { patternSources: string[]; attr: string };
+type OverlayCandidateArgs = {
+  strongPatternSources: string[];
+  weakPatternSources: string[];
+  attr: string;
+};
 type OverlayCandidateResult = { text: string; matchedPatterns: string[] } | null;
 
-// Searches all VISIBLE text on the page (not role/id/class) for a strong
-// cookie-consent signal, then marks the smallest visible element whose
-// text contains it — preferring one that also contains a clickable
-// descendant, since a real consent panel wraps both its message and its
-// buttons, not a bare heading/paragraph line.
+// Searches all VISIBLE text on the page (not role/id/class) for a STRONG
+// cookie-consent signal — an element qualifies as a candidate only if it
+// contains at least one strong match; weak/generic legal wording (footer
+// links like "Privacy Policy", "Cookies", "Terms of Service") is never
+// sufficient on its own, so an ordinary footer nav can never become the
+// consent container. Among qualifying elements, marks the smallest visible
+// one — preferring one that also contains a clickable descendant, since a
+// real consent panel wraps both its message and its buttons, not a bare
+// heading/paragraph line — so <body> or a broad page wrapper can't win
+// merely because consent-related words appear somewhere inside it.
 const findOverlayCandidateFn = new Function(
   "args",
   `
-  var patternSources = args.patternSources;
+  var strongPatternSources = args.strongPatternSources;
+  var weakPatternSources = args.weakPatternSources;
   var attr = args.attr;
   function isVisible(el) {
     var rect = el.getBoundingClientRect();
@@ -110,13 +147,16 @@ const findOverlayCandidateFn = new Function(
     if (!isVisible(el)) continue;
     var text = (el.innerText || '').trim();
     if (!text) continue;
-    for (var j = 0; j < patternSources.length; j++) {
-      if (new RegExp(patternSources[j], 'i').test(text)) {
-        var rect = el.getBoundingClientRect();
-        matches.push({ el: el, text: text, area: rect.width * rect.height, pattern: patternSources[j] });
+    var hasStrongMatch = false;
+    for (var j = 0; j < strongPatternSources.length; j++) {
+      if (new RegExp(strongPatternSources[j], 'i').test(text)) {
+        hasStrongMatch = true;
         break;
       }
     }
+    if (!hasStrongMatch) continue;
+    var rect = el.getBoundingClientRect();
+    matches.push({ el: el, text: text, area: rect.width * rect.height });
   }
   if (matches.length === 0) return null;
   matches.sort(function (a, b) { return a.area - b.area; });
@@ -128,11 +168,15 @@ const findOverlayCandidateFn = new Function(
   }
   var chosen = withControls.length > 0 ? withControls[0] : matches[0];
   chosen.el.setAttribute(attr, 'true');
-  var patternsSeen = [];
-  for (var k = 0; k < matches.length; k++) {
-    if (patternsSeen.indexOf(matches[k].pattern) === -1) patternsSeen.push(matches[k].pattern);
+
+  var allPatternSources = strongPatternSources.concat(weakPatternSources);
+  var matchedPatterns = [];
+  for (var k = 0; k < allPatternSources.length; k++) {
+    if (new RegExp(allPatternSources[k], 'i').test(chosen.text)) {
+      matchedPatterns.push(allPatternSources[k]);
+    }
   }
-  return { text: chosen.text, matchedPatterns: patternsSeen };
+  return { text: chosen.text, matchedPatterns: matchedPatterns };
   `
 ) as unknown as BrowserFn<OverlayCandidateArgs, OverlayCandidateResult>;
 
@@ -326,7 +370,8 @@ async function findCookieOverlayCandidate(
   await page.evaluate(clearMarksFn, OVERLAY_MARK_ATTR);
 
   const result = await page.evaluate(findOverlayCandidateFn, {
-    patternSources: COOKIE_SIGNAL_SOURCES,
+    strongPatternSources: COOKIE_STRONG_SIGNAL_SOURCES,
+    weakPatternSources: COOKIE_WEAK_SIGNAL_SOURCES,
     attr: OVERLAY_MARK_ATTR,
   });
 
