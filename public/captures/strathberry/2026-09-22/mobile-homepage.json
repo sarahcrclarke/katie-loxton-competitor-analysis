@@ -1,7 +1,7 @@
 {
   "competitor": "strathberry",
   "url": "https://www.strathberry.com/",
-  "timestamp": "2026-09-22T09:04:09.390Z",
+  "timestamp": "2026-09-22T09:18:18.352Z",
   "viewport": {
     "width": 390,
     "height": 844,
@@ -12,6 +12,7 @@
   "screenshotPaths": [
     "public/captures/strathberry/2026-09-22/mobile-homepage.webp"
   ],
+  "consentStatus": "rejected",
   "success": true,
   "error": null
 }
