@@ -1,0 +1,10 @@
+{
+  "name": "Katie Loxton Competitor Analysis",
+  "short_name": "KL Competitor Analysis",
+  "description": "Automated competitor monitoring for ecommerce trading analysis.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f9fafb",
+  "theme_color": "#111827",
+  "icons": []
+}
