@@ -193,39 +193,162 @@ const findOverlayCandidateFn = new Function(
   `
 ) as unknown as BrowserFn<OverlayCandidateArgs, OverlayCandidateResult>;
 
-type StructuralCloseArgs = { overlayAttr: string; closeAttr: string };
+export type CloseControlDiagnostic = {
+  tag: string;
+  accessibleName: string;
+  ariaLabel: string | null;
+  title: string | null;
+  rect: { top: number; left: number; right: number; bottom: number; width: number; height: number };
+  clickable: boolean;
+  chosen: boolean;
+};
 
-// Structural fallback for an icon-only close control (no accessible name)
-// positioned near the top-right corner of the already-confirmed overlay.
-// Only runs within that specific overlay element — never globally. Only
-// picks controls with no meaningful accessible name, so a labelled action
-// like "SHOP NOW" or "United States" can never match.
+type StructuralCloseArgs = {
+  overlayAttr: string;
+  closeAttr: string;
+  ctaExcludeFragments: string[];
+};
+type StructuralCloseResult = { found: boolean; candidates: CloseControlDiagnostic[] };
+
+// Text fragments that must never be picked as a "close" control, even if
+// they'd otherwise pass the structural checks below — belt-and-braces on
+// top of the accessible-name matching in findCloseControl().
+const CTA_EXCLUDE_TEXT_FRAGMENTS = [
+  "shop now",
+  "continue",
+  "united states",
+  "yes",
+];
+
+// Structural fallback for a close control confined to the already-confirmed
+// overlay element. Scans every descendant (not just <button>/<a>/[role])
+// because a real "X" is often an SVG icon inside a plain <div>/<span>
+// wrapper with a click handler and no button semantics at all. It never
+// looks outside the overlay and never picks a control whose accessible
+// name is a CTA like "SHOP NOW" or a country name. Also returns a capped
+// list of every clickable candidate it considered, for diagnostics.
 const findStructuralCloseControlFn = new Function(
   "args",
   `
   var overlayAttr = args.overlayAttr;
   var closeAttr = args.closeAttr;
+  var ctaExcludeFragments = args.ctaExcludeFragments;
   var container = document.querySelector('[' + overlayAttr + '="true"]');
-  if (!container) return false;
+  if (!container) return { found: false, candidates: [] };
+
   var containerRect = container.getBoundingClientRect();
-  var marginX = Math.max(24, containerRect.width * 0.2);
-  var marginY = Math.max(24, containerRect.height * 0.2);
-  var candidates = container.querySelectorAll('button, [role="button"], a');
-  for (var i = 0; i < candidates.length; i++) {
-    var el = candidates[i];
+  var marginX = Math.max(24, containerRect.width * 0.25);
+  var marginY = Math.max(24, containerRect.height * 0.25);
+
+  function isExcludedCta(name) {
+    var lower = name.toLowerCase();
+    for (var i = 0; i < ctaExcludeFragments.length; i++) {
+      if (lower.indexOf(ctaExcludeFragments[i]) !== -1) return true;
+    }
+    return false;
+  }
+
+  var all = container.querySelectorAll('*');
+  var candidates = [];
+  for (var i = 0; i < all.length; i++) {
+    var el = all[i];
+    var tag = el.tagName ? el.tagName.toLowerCase() : '';
+    var role = el.getAttribute('role');
+    var ariaLabel = el.getAttribute('aria-label');
+    var titleAttr = el.getAttribute('title');
+    var hasOnClick = el.hasAttribute('onclick');
+    var hasTabIndex = el.hasAttribute('tabindex');
+    var style = window.getComputedStyle(el);
+    var cursorPointer = style.cursor === 'pointer';
+
+    var clickable =
+      tag === 'button' ||
+      tag === 'a' ||
+      tag === 'svg' ||
+      role === 'button' ||
+      role === 'link' ||
+      hasOnClick ||
+      hasTabIndex ||
+      cursorPointer;
+
+    if (!clickable) continue;
+
     var rect = el.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) continue;
-    if (rect.width > 60 || rect.height > 60) continue;
-    var isTopRight = rect.right >= containerRect.right - marginX && rect.top <= containerRect.top + marginY;
-    if (!isTopRight) continue;
-    var accessibleName = (el.getAttribute('aria-label') || el.innerText || '').trim();
-    if (accessibleName.length > 3) continue;
-    el.setAttribute(closeAttr, 'true');
-    return true;
+
+    var accessibleName = (ariaLabel || titleAttr || el.innerText || '').trim();
+
+    candidates.push({
+      tag: tag,
+      accessibleName: accessibleName,
+      ariaLabel: ariaLabel,
+      title: titleAttr,
+      rect: { top: rect.top, left: rect.left, right: rect.right, bottom: rect.bottom, width: rect.width, height: rect.height },
+      el: el,
+      excluded: isExcludedCta(accessibleName)
+    });
   }
-  return false;
+
+  var best = null;
+
+  // 1) Strongest signal: accessible name (aria-label/title/text) literally
+  //    says close/dismiss, regardless of size or position.
+  for (var a = 0; a < candidates.length; a++) {
+    var c = candidates[a];
+    if (c.excluded) continue;
+    var lowerName = c.accessibleName.toLowerCase();
+    if (lowerName.indexOf('close') !== -1 || lowerName.indexOf('dismiss') !== -1) {
+      best = c;
+      break;
+    }
+  }
+
+  // 2) Fallback: icon-only (no/near-no accessible name), small, positioned
+  //    in the top-right corner of the overlay — the classic "X" pattern.
+  if (!best) {
+    var topRightIconCandidates = [];
+    for (var b = 0; b < candidates.length; b++) {
+      var cand = candidates[b];
+      if (cand.excluded) continue;
+      if (cand.accessibleName.length > 3) continue;
+      if (cand.rect.width > 60 || cand.rect.height > 60) continue;
+      var isTopRight = cand.rect.right >= containerRect.right - marginX && cand.rect.top <= containerRect.top + marginY;
+      if (!isTopRight) continue;
+      topRightIconCandidates.push(cand);
+    }
+    topRightIconCandidates.sort(function (x, y) {
+      return (x.rect.width * x.rect.height) - (y.rect.width * y.rect.height);
+    });
+    if (topRightIconCandidates.length > 0) {
+      best = topRightIconCandidates[0];
+    }
+  }
+
+  var found = false;
+  if (best) {
+    best.el.setAttribute(closeAttr, 'true');
+    found = true;
+  }
+
+  // Cap the diagnostics list so logging stays readable on a busy overlay.
+  var diagnosticSource = candidates.slice(0, 25);
+  var resultCandidates = [];
+  for (var d = 0; d < diagnosticSource.length; d++) {
+    var dc = diagnosticSource[d];
+    resultCandidates.push({
+      tag: dc.tag,
+      accessibleName: dc.accessibleName,
+      ariaLabel: dc.ariaLabel,
+      title: dc.title,
+      rect: dc.rect,
+      clickable: true,
+      chosen: best === dc
+    });
+  }
+
+  return { found: found, candidates: resultCandidates };
   `
-) as unknown as BrowserFn<StructuralCloseArgs, boolean>;
+) as unknown as BrowserFn<StructuralCloseArgs, StructuralCloseResult>;
 
 // Exposed only so the regression test can exercise exactly what gets
 // shipped to the browser (see scripts/lib/region.browser-eval.test.ts).
@@ -259,22 +382,57 @@ async function findRegionOverlayCandidate(
   };
 }
 
-async function findStructuralCloseControl(page: Page): Promise<Locator | null> {
+function logCloseControlDiagnostics(candidates: CloseControlDiagnostic[]): void {
+  if (candidates.length === 0) {
+    console.log("Close control candidates: none found within overlay");
+    return;
+  }
+  for (const c of candidates) {
+    console.log(
+      `Close control candidate: tag=${c.tag} accessibleName=${JSON.stringify(
+        c.accessibleName
+      )} ariaLabel=${JSON.stringify(c.ariaLabel)} title=${JSON.stringify(
+        c.title
+      )} rect=${JSON.stringify(c.rect)} clickable=${c.clickable} chosen=${c.chosen}`
+    );
+  }
+}
+
+/**
+ * Scans every clickable-looking descendant of the confirmed overlay
+ * (buttons, links, role="button", elements with an onclick/tabindex/
+ * pointer-cursor, or a bare <svg> icon) and picks the best close control —
+ * always logging what it considered so a live failure is debuggable from
+ * the GitHub Actions log alone.
+ */
+async function findStructuralCloseControl(
+  page: Page
+): Promise<{ control: Locator | null; candidates: CloseControlDiagnostic[] }> {
   await page.evaluate(clearMarksFn, CLOSE_MARK_ATTR);
 
-  const found = await page.evaluate(findStructuralCloseControlFn, {
+  const { found, candidates } = await page.evaluate(findStructuralCloseControlFn, {
     overlayAttr: OVERLAY_MARK_ATTR,
     closeAttr: CLOSE_MARK_ATTR,
+    ctaExcludeFragments: CTA_EXCLUDE_TEXT_FRAGMENTS,
   });
 
-  if (!found) return null;
-  return page.locator(`[${CLOSE_MARK_ATTR}="true"]`).first();
+  return {
+    control: found ? page.locator(`[${CLOSE_MARK_ATTR}="true"]`).first() : null,
+    candidates,
+  };
 }
 
 async function findCloseControl(
   page: Page,
   overlay: Locator
 ): Promise<{ control: Locator | null; strategy: string }> {
+  // Always run the structural scan first (even though accessible strategies
+  // are tried first below) so its diagnostics are logged on every run, not
+  // only on failure — that's what makes a live GitHub Actions run
+  // debuggable if this still doesn't find the right element.
+  const { control: structuralControl, candidates } = await findStructuralCloseControl(page);
+  logCloseControlDiagnostics(candidates);
+
   const accessibleStrategies: { name: string; locator: Locator }[] = [
     {
       name: "accessible-role",
@@ -285,6 +443,10 @@ async function findCloseControl(
       locator: overlay
         .locator('[aria-label*="close" i], [aria-label*="dismiss" i]')
         .first(),
+    },
+    {
+      name: "title-attribute",
+      locator: overlay.locator('[title*="close" i], [title*="dismiss" i]').first(),
     },
     {
       name: "text-match",
@@ -305,9 +467,8 @@ async function findCloseControl(
     }
   }
 
-  const structural = await findStructuralCloseControl(page);
-  if (structural) {
-    return { control: structural, strategy: "structural-top-right" };
+  if (structuralControl) {
+    return { control: structuralControl, strategy: "structural-top-right" };
   }
 
   return { control: null, strategy: "none-found" };
