@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "capture:strathberry": "tsx scripts/capture-strathberry.ts"
+    "capture:strathberry": "tsx scripts/capture-strathberry.ts",
+    "test:region": "tsx scripts/lib/region.browser-eval.test.ts"
   },
   "dependencies": {
     "next": "^15.0.3",
