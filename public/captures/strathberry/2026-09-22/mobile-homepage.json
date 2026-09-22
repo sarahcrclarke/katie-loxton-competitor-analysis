@@ -1,7 +1,7 @@
 {
   "competitor": "strathberry",
   "url": "https://www.strathberry.com/",
-  "timestamp": "2026-09-22T16:03:49.636Z",
+  "timestamp": "2026-09-22T16:18:15.975Z",
   "viewport": {
     "width": 390,
     "height": 844,
@@ -9,11 +9,13 @@
     "isMobile": true,
     "label": "390x844 mobile (iPhone-class CSS viewport, 1x)"
   },
-  "screenshotPaths": [],
+  "screenshotPaths": [
+    "public/captures/strathberry/2026-09-22/mobile-homepage.webp"
+  ],
   "consentStatus": "rejected",
-  "regionStatus": null,
-  "detectedStore": null,
-  "detectedCurrency": null,
-  "success": false,
-  "error": "page.evaluate: ReferenceError: __name is not defined\n    at eval (eval at evaluate (:311:30), <anonymous>:1:43)\n    at UtilityScript.evaluate (<anonymous>:313:16)\n    at UtilityScript.<anonymous> (<anonymous>:1:44)"
+  "regionStatus": "could-not-confirm",
+  "detectedStore": "United Kingdom",
+  "detectedCurrency": "GBP",
+  "success": true,
+  "error": null
 }
