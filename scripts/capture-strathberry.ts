@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
 import sharp from "sharp";
+import { dismissCookieConsent, type ConsentStatus } from "./lib/consent";
 
 const COMPETITOR = "strathberry";
 const TARGET_URL = "https://www.strathberry.com/";
@@ -34,6 +35,7 @@ type CaptureRecord = {
     label: string;
   };
   screenshotPaths: string[];
+  consentStatus: ConsentStatus | null;
   success: boolean;
   error: string | null;
 };
@@ -124,6 +126,7 @@ async function main() {
     timestamp,
     viewport: VIEWPORT,
     screenshotPaths: [],
+    consentStatus: null,
     success: false,
     error: null,
   };
@@ -147,6 +150,9 @@ async function main() {
       timeout: 45_000,
     });
 
+    const consentStatus = await dismissCookieConsent(page);
+    record = { ...record, consentStatus };
+
     await scrollThroughPage(page);
 
     const pngBuffer = await page.screenshot({ fullPage: true });
@@ -167,6 +173,8 @@ async function main() {
       `Captured ${COMPETITOR} homepage -> ${screenshotPaths.join(", ")}`
     );
   } catch (err) {
+    // Preserve consentStatus if it was already determined before the
+    // failure (e.g. screenshot/encoding error after a successful reject).
     record = {
       ...record,
       screenshotPaths: [],
