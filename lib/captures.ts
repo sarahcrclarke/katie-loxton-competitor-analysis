@@ -12,7 +12,7 @@ export type CaptureRecord = {
     isMobile: boolean;
     label: string;
   };
-  screenshotPath: string;
+  screenshotPaths: string[];
   success: boolean;
   error: string | null;
 };

@@ -24,12 +24,15 @@ export default async function Home() {
 
         {capture ? (
           <div className="overflow-hidden rounded-lg border border-gray-200 bg-white shadow-sm">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src={`/${capture.screenshotPath.replace(/^public\//, "")}`}
-              alt="Strathberry mobile homepage screenshot"
-              className="w-full"
-            />
+            {capture.screenshotPaths.map((screenshotPath) => (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                key={screenshotPath}
+                src={`/${screenshotPath.replace(/^public\//, "")}`}
+                alt="Strathberry mobile homepage screenshot"
+                className="w-full"
+              />
+            ))}
             <dl className="grid grid-cols-2 gap-2 border-t border-gray-200 p-4 text-xs text-gray-600">
               <dt className="font-medium">URL</dt>
               <dd className="truncate">{capture.url}</dd>
