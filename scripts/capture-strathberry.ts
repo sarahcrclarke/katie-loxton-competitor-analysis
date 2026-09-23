@@ -3,7 +3,8 @@ import path from "node:path";
 import { chromium } from "playwright";
 import sharp from "sharp";
 import { dismissCookieConsent, type ConsentStatus } from "./lib/consent";
-import { confirmUkRegion, type RegionStatus } from "./lib/region";
+import { confirmUkRegion, isRegionSignalVisible, type RegionStatus } from "./lib/region";
+import { waitForRegionThenHandle } from "./lib/region-wait";
 
 const COMPETITOR = "strathberry";
 const TARGET_URL = "https://www.strathberry.com/";
@@ -160,8 +161,18 @@ async function main() {
     const consentStatus = await dismissCookieConsent(page);
     record = { ...record, consentStatus };
 
+    // The region/shipping overlay has been observed appearing AFTER cookie
+    // consent is dismissed but before a single immediate check would catch
+    // it — a timing/race condition. Poll (bounded, not a blind sleep) for
+    // it to appear before running the existing, unmodified region
+    // detection/dismissal flow.
     const { regionStatus, detectedStore, detectedCurrency } =
-      await confirmUkRegion(page);
+      await waitForRegionThenHandle({
+        checkSignal: () => isRegionSignalVisible(page),
+        handleRegion: () => confirmUkRegion(page),
+        sleep: (ms) => page.waitForTimeout(ms),
+        log: (message) => console.log(message),
+      });
     record = { ...record, regionStatus, detectedStore, detectedCurrency };
 
     await scrollThroughPage(page);

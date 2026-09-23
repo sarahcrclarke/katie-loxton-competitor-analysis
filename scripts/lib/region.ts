@@ -389,7 +389,10 @@ export const __browserEvalPayloads = {
   findStrathberryTopRightIconFn,
 };
 
-async function isRegionSignalVisible(page: Page): Promise<boolean> {
+// Exported (unchanged logic) so the capture orchestrator can poll it for a
+// delayed overlay before running the full confirmUkRegion() flow — see
+// scripts/lib/region-wait.ts.
+export async function isRegionSignalVisible(page: Page): Promise<boolean> {
   return page.evaluate(isRegionSignalVisibleFn, REGION_SIGNAL_SOURCES);
 }
 
