@@ -19,7 +19,7 @@ import assert from "node:assert/strict";
 import vm from "node:vm";
 import { __browserEvalPayloads } from "./region";
 
-type FakeStyle = { visibility: string; display: string; opacity: string };
+type FakeStyle = { visibility: string; display: string; opacity: string; cursor: string };
 type FakeRect = { top: number; left: number; right: number; bottom: number; width: number; height: number };
 
 class FakeElement {
@@ -52,7 +52,13 @@ class FakeElement {
       height: 50,
       ...(opts.rect ?? {}),
     };
-    this.style = { visibility: "visible", display: "block", opacity: "1", ...(opts.style ?? {}) };
+    this.style = {
+      visibility: "visible",
+      display: "block",
+      opacity: "1",
+      cursor: "auto",
+      ...(opts.style ?? {}),
+    };
     this.children = opts.children ?? [];
   }
 
@@ -77,7 +83,7 @@ class FakeElement {
     delete this.attrs[name];
   }
 
-  hasAttr(name: string): boolean {
+  hasAttribute(name: string): boolean {
     return Object.prototype.hasOwnProperty.call(this.attrs, name);
   }
 
@@ -97,11 +103,11 @@ class FakeElement {
   querySelectorAll(selector: string): FakeElement[] {
     const pool = this.allDescendants();
 
-    if (selector === "body *") return pool;
+    if (selector === "body *" || selector === "*") return pool;
 
     const attrOnlyMatch = selector.match(/^\[([a-zA-Z0-9_-]+)\]$/);
     if (attrOnlyMatch) {
-      return pool.filter((el) => el.hasAttr(attrOnlyMatch[1]));
+      return pool.filter((el) => el.hasAttribute(attrOnlyMatch[1]));
     }
 
     const attrValueMatch = selector.match(/^\[([a-zA-Z0-9_-]+)="([^"]*)"\]$/);
@@ -155,11 +161,23 @@ function reconstructInBrowserLikeSandbox<Arg, Result>(
   return script.runInContext(sandbox) as (arg: Arg) => Result;
 }
 
+/**
+ * Models the real Strathberry close control as reported live: an SVG "X"
+ * icon with no text/attributes at all, nested inside a plain <div> wrapper
+ * that has neither an accessible role/name nor an onclick attribute — its
+ * only sign of being clickable is a computed `cursor: pointer` style (as a
+ * CSS-class-driven click target would have in a real browser). This is
+ * exactly the DOM shape the previous button/[role=button]/a-only
+ * structural fallback could not find.
+ */
 function buildStrathberryOverlayFixture() {
-  const closeButton = new FakeElement("button", {
-    text: "",
-    attrs: {},
+  const closeIcon = new FakeElement("svg", {
+    rect: { top: 12, left: 272, right: 288, bottom: 28, width: 16, height: 16 },
+  });
+  const closeWrapper = new FakeElement("div", {
+    style: { cursor: "pointer" },
     rect: { top: 4, left: 260, right: 296, bottom: 40, width: 36, height: 36 },
+    children: [closeIcon],
   });
   const shopNowButton = new FakeElement("button", {
     text: "SHOP NOW",
@@ -175,12 +193,12 @@ function buildStrathberryOverlayFixture() {
       new FakeElement("span", { text: "SHOPPING TO" }),
       new FakeElement("span", { text: "United States" }),
       shopNowButton,
-      closeButton,
+      closeWrapper,
     ],
   });
   const header = new FakeElement("header", { text: "Strathberry" });
   const body = new FakeElement("body", { children: [header, overlayPanel] });
-  return { body, overlayPanel, closeButton, shopNowButton };
+  return { body, overlayPanel, closeWrapper, closeIcon, shopNowButton };
 }
 
 function run() {
@@ -239,28 +257,53 @@ function run() {
     console.log("  ok: findOverlayCandidateFn (marks the overlay panel)");
   }
 
-  // 3. findStructuralCloseControlFn: picks the icon-only top-right control,
-  //    never the labelled "SHOP NOW" button.
+  // 3. findStructuralCloseControlFn: finds the SVG-icon-in-a-plain-div close
+  //    control (no button/role/aria-label — only a computed pointer cursor
+  //    marks it as clickable), never the labelled "SHOP NOW" button, and
+  //    reports every candidate it considered for diagnostics.
   {
-    const { body, overlayPanel, closeButton, shopNowButton } = buildStrathberryOverlayFixture();
+    const { body, overlayPanel, closeWrapper, closeIcon, shopNowButton } =
+      buildStrathberryOverlayFixture();
     overlayPanel.setAttribute("data-kl-region-overlay", "true");
     const document = makeFakeDocument(body);
     const findStructuralCloseControl = reconstructInBrowserLikeSandbox(
       __browserEvalPayloads.findStructuralCloseControlFn,
       document
     );
-    const found = findStructuralCloseControl({
+    const result = findStructuralCloseControl({
       overlayAttr: "data-kl-region-overlay",
       closeAttr: "data-kl-region-close",
+      ctaExcludeFragments: ["shop now", "continue", "united states", "yes"],
     });
-    assert.equal(found, true);
-    assert.equal(closeButton.getAttribute("data-kl-region-close"), "true");
+
+    assert.equal(result.found, true);
+    // Either the icon or its pointer-cursor wrapper is an acceptable pick —
+    // both live inside the same 36x36 top-right close target.
+    const markedOnIcon = closeIcon.getAttribute("data-kl-region-close") === "true";
+    const markedOnWrapper = closeWrapper.getAttribute("data-kl-region-close") === "true";
+    assert.ok(markedOnIcon || markedOnWrapper, "expected the icon or its wrapper to be marked as the close control");
     assert.equal(
       shopNowButton.getAttribute("data-kl-region-close"),
       null,
       "SHOP NOW must never be marked as the close control"
     );
-    console.log("  ok: findStructuralCloseControlFn (picks the icon-only control, not SHOP NOW)");
+
+    // Diagnostics: SHOP NOW must be reported but never chosen; the actual
+    // close target must be reported and chosen.
+    const shopNowCandidate = result.candidates.find((c) => c.accessibleName === "SHOP NOW");
+    assert.ok(shopNowCandidate, "expected SHOP NOW to appear in the diagnostics candidates");
+    assert.equal(shopNowCandidate!.chosen, false);
+
+    const chosenCandidates = result.candidates.filter((c) => c.chosen);
+    assert.equal(chosenCandidates.length, 1, "exactly one candidate should be marked chosen");
+    assert.ok(
+      chosenCandidates[0].tag === "svg" || chosenCandidates[0].tag === "div",
+      `expected the chosen candidate to be the icon or its wrapper, got tag=${chosenCandidates[0].tag}`
+    );
+
+    console.log(
+      "  ok: findStructuralCloseControlFn (finds SVG-in-plain-div close control via cursor:pointer, not SHOP NOW, with diagnostics)"
+    );
   }
 
   // 4. clearMarksFn: removes previously-set marker attributes.
