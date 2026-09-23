@@ -564,6 +564,283 @@ async function run() {
     console.log("  ok: Fixture 11 (no safe target anywhere — safe failure, no arbitrary click)");
   }
 
+  // Fixtures 13-15: resolveStrathberryDialogPanelFn + true-panel-scoped
+  // findStrathberryCloseCandidatesFn — reproduces the exact live DOM shape
+  // reported after diagnostics: the generic overlay seed lands on a small
+  // (294x41) "United States" country-selector button (whose own text
+  // matches "ship(?:ping)? to"), containing an SVG with a "fa-chevron-down"
+  // class, NOT the true modal. The true modal is a Headless UI dialog panel
+  // (id starting "headlessui-dialog-panel-", suffix varies between runs)
+  // nested inside outer wrapper divs that must never be mistaken for it,
+  // containing the heading, UK-confirmation text, the country selector, and
+  // a separate real close control.
+  function buildTruePanelFixture(opts: {
+    panelId?: string | null;
+    chevronDecoyOutsideSeed?: boolean;
+  }) {
+    const chevronPath = new FakeElement("path", {
+      rect: { top: 14, left: 264, right: 274, bottom: 20, width: 10, height: 6 },
+    });
+    const chevronSvg = new FakeElement("svg", {
+      attrs: { class: "svg-inline--fa fa-chevron-down xyz" },
+      rect: { top: 10, left: 260, right: 278, bottom: 26, width: 18, height: 16 },
+      children: [chevronPath],
+    });
+    const countrySelector = new FakeElement("button", {
+      // Own text matches "ship(?:ping)? to" — exactly what live evidence
+      // showed caused the generic seed to land here instead of the panel.
+      text: "Shipping to United States",
+      rect: { top: 120, left: 4, right: 298, bottom: 161, width: 294, height: 41 },
+      children: [chevronSvg],
+    });
+
+    const closePath = new FakeElement("path", {
+      rect: { top: 6, left: 336, right: 344, bottom: 14, width: 8, height: 8 },
+    });
+    const closeSvg = new FakeElement("svg", {
+      attrs: { class: "icon-close" },
+      rect: { top: 2, left: 332, right: 348, bottom: 18, width: 16, height: 16 },
+      children: [closePath],
+    });
+    const closeButton = new FakeElement("button", {
+      rect: { top: 0, left: 328, right: 352, bottom: 20, width: 24, height: 20 },
+      children: [closeSvg],
+    });
+
+    const panelChildren: FakeElement[] = [
+      new FakeElement("h2", { text: "Shipping To United States?" }),
+      new FakeElement("p", { text: "You are currently browsing our United Kingdom store." }),
+      countrySelector,
+      closeButton,
+    ];
+
+    if (opts.chevronDecoyOutsideSeed) {
+      // A second, unrelated fa-chevron-down icon in the panel's top-right
+      // zone, NOT inside the country selector — proves the class-based
+      // exclusion works independently of the ancestor-seed exclusion.
+      const decoyPath = new FakeElement("path", { rect: { top: 6, left: 300, right: 308, bottom: 12, width: 8, height: 6 } });
+      const decoySvg = new FakeElement("svg", {
+        attrs: { class: "fa-chevron-down" },
+        rect: { top: 2, left: 296, right: 312, bottom: 18, width: 16, height: 16 },
+        children: [decoyPath],
+      });
+      panelChildren.push(decoySvg);
+    }
+
+    const panelAttrs: Record<string, string> = {
+      class:
+        "max-w-lg relative w-full transform overflow-hidden pt-4 text-left align-middle shadow-xl transition-all bg-surface-secondary px-0 pb-0",
+    };
+    if (opts.panelId !== null) {
+      panelAttrs.id = opts.panelId ?? "headlessui-dialog-panel-:r10:";
+    }
+    const truePanel = new FakeElement("div", {
+      attrs: panelAttrs,
+      rect: { top: 0, left: 0, right: 358, bottom: 403, width: 358, height: 403 },
+      children: panelChildren,
+    });
+
+    const outerFlexWrapper = new FakeElement("div", {
+      attrs: { class: "flex min-h-full items-center justify-center" },
+      rect: { top: 0, left: 0, right: 390, bottom: 844, width: 390, height: 844 },
+      children: [truePanel],
+    });
+    const outerFixedWrapper = new FakeElement("div", {
+      attrs: { class: "fixed inset-0 overflow-y-auto" },
+      rect: { top: 0, left: 0, right: 390, bottom: 844, width: 390, height: 844 },
+      children: [outerFlexWrapper],
+    });
+
+    const header = new FakeElement("header", { text: "Strathberry" });
+    const body = new FakeElement("body", { children: [header, outerFixedWrapper] });
+    linkParents(body);
+
+    return { body, truePanel, countrySelector, chevronSvg, closeButton, closeSvg, outerFlexWrapper, outerFixedWrapper };
+  }
+
+  const PANEL_MARK_ATTR = "data-kl-region-strathberry-panel";
+
+  // Mirrors the live bug: the generic (locked, must-not-change)
+  // findOverlayCandidateFn resolved the confirmed region-overlay seed to
+  // the small country-selector button rather than the true panel. Marking
+  // it directly here isolates these fixtures to what's actually under
+  // test — resolveStrathberryDialogPanelFn's behavior given that (already
+  // established, wrong) seed — without depending on findOverlayCandidateFn's
+  // generic smallest-match-with-controls heuristic against this fixture's
+  // exact geometry.
+  function seedOnCountrySelector(body: FakeElement, countrySelector: FakeElement) {
+    countrySelector.setAttribute(OVERLAY_ATTR, "true");
+    return { document: makeFakeDocument(body) };
+  }
+
+  // Fixture 13: the generic seed lands on the country-selector button (point
+  // 1); resolveStrathberryDialogPanelFn correctly resolves the TRUE
+  // enclosing Headless UI panel via the id prefix (point 4), never the
+  // outer wrapper divs or the country selector itself.
+  {
+    const { body, truePanel, countrySelector } = buildTruePanelFixture({});
+    const { document } = seedOnCountrySelector(body, countrySelector);
+    assert.equal(
+      countrySelector.getAttribute(OVERLAY_ATTR),
+      "true",
+      "Fixture 13: reproduces the live bug — the seed lands on the country selector"
+    );
+
+    const resolvePanel = reconstructInBrowserLikeSandbox(__browserEvalPayloads.resolveStrathberryDialogPanelFn, document);
+    const panelResult = resolvePanel({ seedAttr: OVERLAY_ATTR, panelMarkAttr: PANEL_MARK_ATTR });
+    assert.equal(panelResult.panelFound, true, "Fixture 13: the true panel must be resolved");
+    assert.equal(panelResult.resolutionStrategy, "headlessui-dialog-panel-id");
+    assert.equal(truePanel.getAttribute(PANEL_MARK_ATTR), "true", "Fixture 13: the TRUE panel must be marked");
+    assert.equal(
+      countrySelector.getAttribute(PANEL_MARK_ATTR),
+      null,
+      "Fixture 13: the nested country-selector button must never be marked as the panel"
+    );
+    console.log("  ok: Fixture 13 (nested US button not mistaken for the true panel; resolved via headlessui id)");
+  }
+
+  // Fixture 14: Headless UI id suffix variation — the resolver must not
+  // depend on any specific generated suffix.
+  {
+    const { body, truePanel, countrySelector } = buildTruePanelFixture({ panelId: "headlessui-dialog-panel-:r347:" });
+    const { document } = seedOnCountrySelector(body, countrySelector);
+    const resolvePanel = reconstructInBrowserLikeSandbox(__browserEvalPayloads.resolveStrathberryDialogPanelFn, document);
+    const panelResult = resolvePanel({ seedAttr: OVERLAY_ATTR, panelMarkAttr: PANEL_MARK_ATTR });
+    assert.equal(panelResult.panelFound, true, "Fixture 14: must resolve regardless of the exact id suffix");
+    assert.equal(panelResult.resolutionStrategy, "headlessui-dialog-panel-id");
+    assert.equal(truePanel.getAttribute(PANEL_MARK_ATTR), "true");
+    console.log("  ok: Fixture 14 (Headless UI id suffix variation does not break resolution)");
+  }
+
+  // Fixture 15: no Headless UI id at all — structural/text fallback must
+  // still resolve the true panel (not an outer wrapper) via shipping+UK
+  // text combined with modal-sized geometry.
+  {
+    const { body, truePanel, countrySelector, outerFlexWrapper, outerFixedWrapper } = buildTruePanelFixture({ panelId: null });
+    const { document } = seedOnCountrySelector(body, countrySelector);
+    const resolvePanel = reconstructInBrowserLikeSandbox(__browserEvalPayloads.resolveStrathberryDialogPanelFn, document);
+    const panelResult = resolvePanel({ seedAttr: OVERLAY_ATTR, panelMarkAttr: PANEL_MARK_ATTR });
+    assert.equal(panelResult.panelFound, true, "Fixture 15: the text/size fallback must still find the panel");
+    assert.equal(panelResult.resolutionStrategy, "text-and-size-heuristic");
+    assert.equal(truePanel.getAttribute(PANEL_MARK_ATTR), "true", "Fixture 15: the true (innermost) panel must be picked");
+    assert.equal(outerFlexWrapper.getAttribute(PANEL_MARK_ATTR), null, "Fixture 15: outer flex wrapper must never be picked");
+    assert.equal(outerFixedWrapper.getAttribute(PANEL_MARK_ATTR), null, "Fixture 15: outer fixed wrapper must never be picked");
+    console.log("  ok: Fixture 15 (structural/text fallback resolves the true panel, not an outer wrapper)");
+  }
+
+  // Fixture 16: close-control discovery scoped to the TRUE panel — proves
+  // points 2/3/5/6/7/8/9: fa-chevron-down (and its path) are never treated
+  // as close, the real close control (outside the country selector) is the
+  // one selected, and the country selector / SHOP NOW-style wording is
+  // never a candidate even when it sits inside the resolved panel boundary.
+  {
+    const { body, truePanel, countrySelector, chevronSvg, closeButton, closeSvg } = buildTruePanelFixture({
+      chevronDecoyOutsideSeed: true,
+    });
+    const { document } = seedOnCountrySelector(body, countrySelector);
+
+    const resolvePanel = reconstructInBrowserLikeSandbox(__browserEvalPayloads.resolveStrathberryDialogPanelFn, document);
+    resolvePanel({ seedAttr: OVERLAY_ATTR, panelMarkAttr: PANEL_MARK_ATTR });
+    assert.equal(truePanel.getAttribute(PANEL_MARK_ATTR), "true");
+
+    const findCandidates = reconstructInBrowserLikeSandbox(__browserEvalPayloads.findStrathberryCloseCandidatesFn, document);
+    const result = findCandidates({
+      overlayAttr: PANEL_MARK_ATTR,
+      markAttr: STRATHBERRY_CANDIDATE_ATTR,
+      excludeFragments: STRATHBERRY_EXCLUDE_FRAGMENTS,
+      excludeAncestorAttr: OVERLAY_ATTR,
+    });
+
+    assert.equal(result.found, true, "Fixture 16: a real close candidate must be found inside the true panel");
+    const top = acceptedOrderZero(result.candidates);
+    assert.equal(closeButton.getAttribute(STRATHBERRY_CANDIDATE_ATTR), "0", "Fixture 16: the real close control must be selected");
+    assert.ok(top && (top.tag === "button" || top.tag === "svg"), "Fixture 16: expected the real close control to win");
+
+    assert.equal(
+      countrySelector.getAttribute(STRATHBERRY_CANDIDATE_ATTR),
+      null,
+      "Fixture 16: the US country-selector button must never be a candidate"
+    );
+    assert.equal(
+      chevronSvg.getAttribute(STRATHBERRY_CANDIDATE_ATTR),
+      null,
+      "Fixture 16: the fa-chevron-down SVG must never be a candidate"
+    );
+
+    const countrySelectorDiag = result.candidates.find((c) => c.tag === "button" && c.insideCountrySelector);
+    if (countrySelectorDiag) {
+      assert.equal(countrySelectorDiag.accepted, false);
+      assert.equal(countrySelectorDiag.rejectReason, "inside country selector control");
+    }
+    const chevronDiag = result.candidates.find((c) => c.hasChevronClass);
+    if (chevronDiag) {
+      assert.equal(chevronDiag.accepted, false);
+      assert.ok(
+        chevronDiag.rejectReason === "fa-chevron-down icon (country selector chevron)" ||
+          chevronDiag.rejectReason === "inside country selector control"
+      );
+    }
+    console.log(
+      "  ok: Fixture 16 (fa-chevron-down and country selector explicitly excluded; real close control selected)"
+    );
+  }
+
+  // Fixture 17: end-to-end dismissal — clicking the resolved real close
+  // control (via the bounded retry, exactly as attemptStrathberryDismissal
+  // wires it) dismisses the TRUE panel specifically, never the country
+  // selector/dropdown, never SHOP NOW, and verification reports true.
+  {
+    const { body, truePanel, countrySelector, closeButton } = buildTruePanelFixture({});
+    const { document } = seedOnCountrySelector(body, countrySelector);
+
+    const resolvePanel = reconstructInBrowserLikeSandbox(__browserEvalPayloads.resolveStrathberryDialogPanelFn, document);
+    resolvePanel({ seedAttr: OVERLAY_ATTR, panelMarkAttr: PANEL_MARK_ATTR });
+
+    const findCandidates = reconstructInBrowserLikeSandbox(__browserEvalPayloads.findStrathberryCloseCandidatesFn, document);
+    const result = findCandidates({
+      overlayAttr: PANEL_MARK_ATTR,
+      markAttr: STRATHBERRY_CANDIDATE_ATTR,
+      excludeFragments: STRATHBERRY_EXCLUDE_FRAGMENTS,
+      excludeAncestorAttr: OVERLAY_ATTR,
+    });
+    assert.equal(result.found, true);
+
+    let usButtonClicked = false;
+    let shopNowClicked = false;
+
+    const dismissed = await attemptBoundedCandidateDismissal({
+      candidateCount: result.candidateCount,
+      click: async (index) => {
+        const marked = truePanel
+          .allDescendantsPublic()
+          .find((el) => el.getAttribute(STRATHBERRY_CANDIDATE_ATTR) === String(index));
+        if (!marked) return { success: false, error: "not found" };
+        if (marked === countrySelector || countrySelector.allDescendantsPublic().includes(marked)) {
+          usButtonClicked = true;
+        }
+        if (marked.innerText.toUpperCase().includes("SHOP NOW")) {
+          shopNowClicked = true;
+        }
+        if (marked === closeButton || closeButton.allDescendantsPublic().includes(marked)) {
+          // Simulate the real click actually removing/hiding the true panel.
+          truePanel.hide();
+        }
+        return { success: true };
+      },
+      dispatchSecondaryClick: async () => {},
+      isOverlayGone: async () => {
+        const stillVisible = truePanel.style.display !== "none" && truePanel.getBoundingClientRect().width > 0;
+        return !stillVisible;
+      },
+      sleep: async () => {},
+    });
+
+    assert.equal(dismissed, true, "Fixture 17: the real close click must dismiss the true panel");
+    assert.equal(usButtonClicked, false, "Fixture 17: the US button must never be clicked");
+    assert.equal(shopNowClicked, false, "Fixture 17: SHOP NOW must never be clicked");
+    console.log("  ok: Fixture 17 (real close click dismisses the true panel; US button/SHOP NOW never clicked)");
+  }
+
   // Fixture 12 (gate unchanged): covered by the existing
   // strathberryFallbackAppliesTo assertions below — that function was not
   // touched by this change, so "Shopping To ..." and "Shipping To ..."
