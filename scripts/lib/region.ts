@@ -519,6 +519,24 @@ async function findStrathberryTopRightIconCloseControl(
   return page.locator(`[${CLOSE_MARK_ATTR}="true"]`).first();
 }
 
+// The gate deciding whether the Strathberry-specific fallback above may
+// run at all: only when the confirmed overlay's own matched region
+// signals include wording specific to Strathberry's "Shopping To ...?" /
+// "Shipping To ...?" prompt (both observed live), not just any other
+// generic region/store-switch signal. Exported (pure, no side effects) so
+// this exact gate can be tested directly against known matchedPatterns
+// inputs without needing a Page. Values compared are the exact regex
+// *source* strings from REGION_SIGNAL_SOURCES (region.ts, unchanged) that
+// findOverlayCandidateFn reports as matched.
+export function strathberryFallbackAppliesTo(matchedPatterns: string[]): boolean {
+  return matchedPatterns.some(
+    (pattern) =>
+      pattern === "shopping to" ||
+      pattern === "shopping to united states" ||
+      pattern === "ship(?:ping)? to"
+  );
+}
+
 /**
  * Detects a country/region/currency ("shopping to X?") overlay by scanning
  * visible page TEXT (not role/id/class) and, only when there is positive
@@ -586,14 +604,11 @@ export async function confirmUkRegion(page: Page): Promise<RegionResult> {
 
   // Last-resort fallback for Strathberry's own overlay specifically, only
   // once the generic strategies have already failed and only when this is
-  // genuinely the "Shopping To ...?" overlay (not some other region signal
-  // like a plain "ship to" mention) with UK storefront evidence already
-  // confirmed above.
+  // genuinely the "Shopping To ...?" / "Shipping To ...?" overlay (not some
+  // other unrelated region signal) with UK storefront evidence already
+  // confirmed above. See strathberryFallbackAppliesTo() for the gate.
   if (!closeControl) {
-    const hasShoppingToWording = overlay.matchedPatterns.some(
-      (pattern) => pattern === "shopping to" || pattern === "shopping to united states"
-    );
-    if (hasShoppingToWording) {
+    if (strathberryFallbackAppliesTo(overlay.matchedPatterns)) {
       const strathberryControl = await findStrathberryTopRightIconCloseControl(page);
       if (strathberryControl) {
         closeControl = strathberryControl;

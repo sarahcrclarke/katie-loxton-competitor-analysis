@@ -17,7 +17,7 @@
  */
 import assert from "node:assert/strict";
 import vm from "node:vm";
-import { __browserEvalPayloads } from "./region";
+import { __browserEvalPayloads, strathberryFallbackAppliesTo } from "./region";
 
 type FakeStyle = { visibility: string; display: string; opacity: string };
 type FakeRect = { top: number; left: number; right: number; bottom: number; width: number; height: number };
@@ -458,6 +458,48 @@ function run() {
     const getBodyInnerText = reconstructInBrowserLikeSandbox(__browserEvalPayloads.getBodyInnerTextFn, document);
     assert.match(getBodyInnerText(undefined as never), /Shopping To United States/);
     console.log("  ok: getBodyInnerTextFn");
+  }
+
+  // 6. strathberryFallbackAppliesTo: the gate deciding whether the
+  //    Strathberry-specific close fallback may run. Root-caused live
+  //    failure: Strathberry's "Shipping To United States?" wording only
+  //    matches the "ship(?:ping)? to" REGION_SIGNAL_SOURCES entry, not the
+  //    "shopping to" ones, so the gate must also accept that pattern.
+  {
+    assert.equal(
+      strathberryFallbackAppliesTo(["shopping to"]),
+      true,
+      '"shopping to" must trigger the fallback'
+    );
+    assert.equal(
+      strathberryFallbackAppliesTo(["shopping to united states"]),
+      true,
+      '"shopping to united states" must trigger the fallback'
+    );
+    assert.equal(
+      strathberryFallbackAppliesTo(["ship(?:ping)? to"]),
+      true,
+      '"ship(?:ping)? to" (the live "Shipping To ...?" match) must trigger the fallback'
+    );
+    assert.equal(
+      strathberryFallbackAppliesTo(["ship(?:ping)? to", "currently browsing our united kingdom store"]),
+      true,
+      "must trigger when ship(?:ping)? to is present alongside other matched patterns (the exact live matchedPatterns)"
+    );
+    assert.equal(
+      strathberryFallbackAppliesTo(["select (?:your )?(?:shipping )?country"]),
+      false,
+      "an unrelated generic region signal must NOT trigger this Strathberry-specific fallback"
+    );
+    assert.equal(
+      strathberryFallbackAppliesTo(["currently browsing our united kingdom store"]),
+      false,
+      "the UK-confirmation signal alone (no shopping/shipping wording) must NOT trigger the fallback"
+    );
+    assert.equal(strathberryFallbackAppliesTo([]), false, "no matched patterns must NOT trigger the fallback");
+    console.log(
+      "  ok: strathberryFallbackAppliesTo (shopping to / shopping to united states / ship(?:ping)? to all trigger; unrelated signals don't)"
+    );
   }
 
   console.log("All region.ts browser-evaluation regression tests passed.");
