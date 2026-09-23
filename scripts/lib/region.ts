@@ -227,6 +227,157 @@ const findStructuralCloseControlFn = new Function(
   `
 ) as unknown as BrowserFn<StructuralCloseArgs, boolean>;
 
+export type StrathberryCloseCandidateDiagnostic = {
+  tag: string;
+  text: string;
+  ariaLabel: string | null;
+  title: string | null;
+  rect: { top: number; left: number; right: number; bottom: number; width: number; height: number };
+  hasSvgDescendant: boolean;
+  excluded: boolean;
+  chosen: boolean;
+};
+
+type StrathberryFallbackArgs = {
+  overlayAttr: string;
+  closeAttr: string;
+  excludeFragments: string[];
+};
+type StrathberryFallbackResult = {
+  inspectedCount: number;
+  candidates: StrathberryCloseCandidateDiagnostic[];
+  found: boolean;
+};
+
+// Text that must never be picked as a close control, even if it happens to
+// be small and top-right positioned — belt-and-braces on top of requiring
+// "no meaningful text" below.
+const STRATHBERRY_FALLBACK_EXCLUDE_FRAGMENTS = [
+  "shop now",
+  "united states",
+  "continue",
+  "yes",
+  "country",
+  "dropdown",
+];
+
+// Last-resort fallback for the Strathberry "Shopping To ...?" overlay
+// specifically: its visible close "X" has been observed with NO button
+// tag, no role, no aria-label/title, no tabindex, no onclick, and no
+// cursor:pointer — so the generic structural fallback (which requires at
+// least one of those) never finds it. This scans every VISIBLE descendant
+// of the already-confirmed overlay (never the page globally), regardless
+// of tag/role/attributes, and looks purely at position, size and text:
+// small, top-right, and with no meaningful CTA/country text. Prefers a
+// candidate that visibly wraps an SVG/path icon. Explicitly excludes any
+// candidate whose text mentions "SHOP NOW", "United States", "Continue",
+// "Yes", or the country selector, as a second safety net.
+const findStrathberryTopRightIconFn = new Function(
+  "args",
+  `
+  var overlayAttr = args.overlayAttr;
+  var closeAttr = args.closeAttr;
+  var excludeFragments = args.excludeFragments;
+  var container = document.querySelector('[' + overlayAttr + '="true"]');
+  if (!container) return { inspectedCount: 0, candidates: [], found: false };
+
+  var containerRect = container.getBoundingClientRect();
+  var marginX = Math.max(24, containerRect.width * 0.25);
+  var marginY = Math.max(24, containerRect.height * 0.25);
+
+  function isVisible(el) {
+    var rect = el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return false;
+    var style = window.getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none') return false;
+    if (parseFloat(style.opacity) === 0) return false;
+    return true;
+  }
+
+  function containsExcludedText(text) {
+    var lower = text.toLowerCase();
+    for (var i = 0; i < excludeFragments.length; i++) {
+      if (lower.indexOf(excludeFragments[i]) !== -1) return true;
+    }
+    return false;
+  }
+
+  var all = container.querySelectorAll('*');
+  var inspectedCount = 0;
+  var topRightSmall = [];
+
+  for (var i = 0; i < all.length; i++) {
+    var el = all[i];
+    if (!isVisible(el)) continue;
+    inspectedCount++;
+
+    var rect = el.getBoundingClientRect();
+    if (rect.width > 60 || rect.height > 60) continue;
+
+    var isTopRight = rect.right >= containerRect.right - marginX && rect.top <= containerRect.top + marginY;
+    if (!isTopRight) continue;
+
+    var tag = el.tagName ? el.tagName.toLowerCase() : '';
+    var ariaLabel = el.getAttribute('aria-label');
+    var titleAttr = el.getAttribute('title');
+    var text = (el.innerText || '').trim();
+    var accessibleText = (ariaLabel || titleAttr || text || '').trim();
+    var hasSvgDescendant = tag === 'svg' || tag === 'path' || el.querySelectorAll('svg, path').length > 0;
+
+    var excluded = accessibleText.length > 3 || containsExcludedText(accessibleText) || containsExcludedText(text);
+
+    topRightSmall.push({
+      el: el,
+      tag: tag,
+      text: text,
+      ariaLabel: ariaLabel,
+      title: titleAttr,
+      rect: {
+        top: rect.top - containerRect.top,
+        left: rect.left - containerRect.left,
+        right: rect.right - containerRect.left,
+        bottom: rect.bottom - containerRect.top,
+        width: rect.width,
+        height: rect.height
+      },
+      hasSvgDescendant: hasSvgDescendant,
+      excluded: excluded,
+      area: rect.width * rect.height
+    });
+  }
+
+  var eligible = topRightSmall.filter(function (c) { return !c.excluded; });
+  var withSvg = eligible.filter(function (c) { return c.hasSvgDescendant; });
+  var pool = withSvg.length > 0 ? withSvg : eligible;
+  pool.sort(function (a, b) { return a.area - b.area; });
+  var best = pool.length > 0 ? pool[0] : null;
+
+  var found = false;
+  if (best) {
+    best.el.setAttribute(closeAttr, 'true');
+    found = true;
+  }
+
+  var diagnosticSource = topRightSmall.slice(0, 20);
+  var candidates = [];
+  for (var d = 0; d < diagnosticSource.length; d++) {
+    var dc = diagnosticSource[d];
+    candidates.push({
+      tag: dc.tag,
+      text: dc.text,
+      ariaLabel: dc.ariaLabel,
+      title: dc.title,
+      rect: dc.rect,
+      hasSvgDescendant: dc.hasSvgDescendant,
+      excluded: dc.excluded,
+      chosen: best === dc
+    });
+  }
+
+  return { inspectedCount: inspectedCount, candidates: candidates, found: found };
+  `
+) as unknown as BrowserFn<StrathberryFallbackArgs, StrathberryFallbackResult>;
+
 // Exposed only so the regression test can exercise exactly what gets
 // shipped to the browser (see scripts/lib/region.browser-eval.test.ts).
 export const __browserEvalPayloads = {
@@ -235,6 +386,7 @@ export const __browserEvalPayloads = {
   isRegionSignalVisibleFn,
   findOverlayCandidateFn,
   findStructuralCloseControlFn,
+  findStrathberryTopRightIconFn,
 };
 
 async function isRegionSignalVisible(page: Page): Promise<boolean> {
@@ -313,6 +465,57 @@ async function findCloseControl(
   return { control: null, strategy: "none-found" };
 }
 
+function logStrathberryFallbackDiagnostics(
+  inspectedCount: number,
+  candidates: StrathberryCloseCandidateDiagnostic[]
+): void {
+  console.log(`Strathberry fallback: elements inspected inside overlay: ${inspectedCount}`);
+  console.log(`Strathberry fallback: top-right candidates found: ${candidates.length}`);
+  if (candidates.length === 0) {
+    console.log("Strathberry fallback: candidate: none found within overlay");
+    return;
+  }
+  for (const c of candidates) {
+    console.log(
+      `Strathberry fallback: candidate: tag=${c.tag} text=${JSON.stringify(
+        c.text
+      )} ariaLabel=${JSON.stringify(c.ariaLabel)} title=${JSON.stringify(
+        c.title
+      )} rect=${JSON.stringify(c.rect)} hasSvgDescendant=${c.hasSvgDescendant} excluded=${c.excluded} chosen=${
+        c.chosen
+      }`
+    );
+  }
+}
+
+/**
+ * Last-resort fallback used ONLY when the generic close-control strategies
+ * above return none-found, AND only when all of the following already
+ * hold: a region overlay was positively identified, UK storefront evidence
+ * was positively found, and the overlay's own matched signals include the
+ * Strathberry "Shopping To ..." wording specifically (not just some other
+ * generic region signal). It never searches outside the confirmed overlay.
+ * See findStrathberryTopRightIconFn above for the selection logic.
+ */
+async function findStrathberryTopRightIconCloseControl(
+  page: Page
+): Promise<Locator | null> {
+  await page.evaluate(clearMarksFn, CLOSE_MARK_ATTR);
+
+  const { inspectedCount, candidates, found } = await page.evaluate(
+    findStrathberryTopRightIconFn,
+    {
+      overlayAttr: OVERLAY_MARK_ATTR,
+      closeAttr: CLOSE_MARK_ATTR,
+      excludeFragments: STRATHBERRY_FALLBACK_EXCLUDE_FRAGMENTS,
+    }
+  );
+  logStrathberryFallbackDiagnostics(inspectedCount, candidates);
+
+  if (!found) return null;
+  return page.locator(`[${CLOSE_MARK_ATTR}="true"]`).first();
+}
+
 /**
  * Detects a country/region/currency ("shopping to X?") overlay by scanning
  * visible page TEXT (not role/id/class) and, only when there is positive
@@ -373,10 +576,29 @@ export async function confirmUkRegion(page: Page): Promise<RegionResult> {
     return { regionStatus: "could-not-confirm", detectedStore, detectedCurrency };
   }
 
-  const { control: closeControl, strategy } = await findCloseControl(
+  let { control: closeControl, strategy } = await findCloseControl(
     page,
     overlay.locator
   );
+
+  // Last-resort fallback for Strathberry's own overlay specifically, only
+  // once the generic strategies have already failed and only when this is
+  // genuinely the "Shopping To ...?" overlay (not some other region signal
+  // like a plain "ship to" mention) with UK storefront evidence already
+  // confirmed above.
+  if (!closeControl) {
+    const hasShoppingToWording = overlay.matchedPatterns.some(
+      (pattern) => pattern === "shopping to" || pattern === "shopping to united states"
+    );
+    if (hasShoppingToWording) {
+      const strathberryControl = await findStrathberryTopRightIconCloseControl(page);
+      if (strathberryControl) {
+        closeControl = strathberryControl;
+        strategy = "strathberry-top-right-icon-fallback";
+      }
+    }
+  }
+
   console.log(`Close control strategy: ${strategy}`);
 
   if (!closeControl) {
