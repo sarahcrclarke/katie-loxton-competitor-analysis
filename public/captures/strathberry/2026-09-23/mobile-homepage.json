@@ -1,7 +1,7 @@
 {
   "competitor": "strathberry",
   "url": "https://www.strathberry.com/",
-  "timestamp": "2026-09-23T07:44:14.740Z",
+  "timestamp": "2026-09-23T07:58:01.323Z",
   "viewport": {
     "width": 390,
     "height": 844,
@@ -14,7 +14,7 @@
   ],
   "consentStatus": "rejected",
   "regionStatus": "could-not-confirm",
-  "detectedStore": null,
+  "detectedStore": "United Kingdom",
   "detectedCurrency": "GBP",
   "success": true,
   "error": null
