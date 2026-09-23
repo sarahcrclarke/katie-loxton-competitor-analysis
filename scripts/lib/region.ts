@@ -13,6 +13,10 @@ export type RegionResult = {
 
 const OVERLAY_MARK_ATTR = "data-kl-region-overlay";
 const CLOSE_MARK_ATTR = "data-kl-region-close";
+// Distinct from CLOSE_MARK_ATTR (used by the generic structural fallback):
+// marks the ranked, ordered set of safe click-target candidates resolved
+// for the Strathberry-specific bounded retry below.
+const STRATHBERRY_CANDIDATE_MARK_ATTR = "data-kl-region-close-candidate";
 
 // Text signals strong enough to mean "this element is a country/region/
 // currency/store-switch prompt". Regex *sources* (strings, no literal
@@ -227,31 +231,9 @@ const findStructuralCloseControlFn = new Function(
   `
 ) as unknown as BrowserFn<StructuralCloseArgs, boolean>;
 
-export type StrathberryCloseCandidateDiagnostic = {
-  tag: string;
-  text: string;
-  ariaLabel: string | null;
-  title: string | null;
-  rect: { top: number; left: number; right: number; bottom: number; width: number; height: number };
-  hasSvgDescendant: boolean;
-  excluded: boolean;
-  chosen: boolean;
-};
-
-type StrathberryFallbackArgs = {
-  overlayAttr: string;
-  closeAttr: string;
-  excludeFragments: string[];
-};
-type StrathberryFallbackResult = {
-  inspectedCount: number;
-  candidates: StrathberryCloseCandidateDiagnostic[];
-  found: boolean;
-};
-
 // Text that must never be picked as a close control, even if it happens to
-// be small and top-right positioned — belt-and-braces on top of requiring
-// "no meaningful text" below.
+// be small and top-right positioned — belt-and-braces on top of the
+// structural exclusions in findStrathberryCloseCandidatesFn below.
 const STRATHBERRY_FALLBACK_EXCLUDE_FRAGMENTS = [
   "shop now",
   "united states",
@@ -261,25 +243,74 @@ const STRATHBERRY_FALLBACK_EXCLUDE_FRAGMENTS = [
   "dropdown",
 ];
 
-// Last-resort fallback for the Strathberry "Shopping To ...?" overlay
-// specifically: its visible close "X" has been observed with NO button
-// tag, no role, no aria-label/title, no tabindex, no onclick, and no
-// cursor:pointer — so the generic structural fallback (which requires at
-// least one of those) never finds it. This scans every VISIBLE descendant
-// of the already-confirmed overlay (never the page globally), regardless
-// of tag/role/attributes, and looks purely at position, size and text:
-// small, top-right, and with no meaningful CTA/country text. Prefers a
-// candidate that visibly wraps an SVG/path icon. Explicitly excludes any
-// candidate whose text mentions "SHOP NOW", "United States", "Continue",
-// "Yes", or the country selector, as a second safety net.
-const findStrathberryTopRightIconFn = new Function(
+export type StrathberryVisualX = {
+  tag: string;
+  rect: { top: number; left: number; right: number; bottom: number; width: number; height: number };
+} | null;
+
+export type StrathberryCandidateDiagnostic = {
+  tag: string;
+  rect: { top: number; left: number; right: number; bottom: number; width: number; height: number };
+  role: string | null;
+  ariaLabel: string | null;
+  title: string | null;
+  hasTabIndex: boolean;
+  cursor: string;
+  pointerEvents: string;
+  hasOnClick: boolean;
+  text: string;
+  hasSvgOrPath: boolean;
+  relationship: string;
+  rank: number;
+  accepted: boolean;
+  rejectReason: string | null;
+  // Index into the ranked, accepted-only candidate list (matches the
+  // sequential mark attribute value used to build a Locator for it), or -1
+  // if this candidate was rejected.
+  order: number;
+};
+
+type StrathberryResolveArgs = {
+  overlayAttr: string;
+  markAttr: string;
+  excludeFragments: string[];
+};
+type StrathberryResolveResult = {
+  visualX: StrathberryVisualX;
+  candidates: StrathberryCandidateDiagnostic[];
+  candidateCount: number;
+  found: boolean;
+};
+
+// Separates two responsibilities that the previous implementation
+// conflated:
+//
+//   (A) VISUAL X DISCOVERY — find the small, top-right, non-CTA icon that
+//       visually represents the close "X" inside the already-confirmed
+//       region overlay. Never searches outside that overlay.
+//
+//   (B) CLICK-TARGET RESOLUTION — starting from that visual element, walk
+//       its ancestor chain (stopping at the overlay boundary) and rank
+//       every node by how likely it is to be the actual interactive
+//       target: button > [role=button] > <a> > [onclick] > [tabindex] >
+//       cursor:pointer > <svg> > a generic small icon-only wrapper >
+//       <path> (last resort — the artwork node itself). The smallest
+//       bounding box is only used as a tie-breaker WITHIN the same rank,
+//       never as the primary rule — an inner <path> no longer automatically
+//       wins just because it happens to be the smallest node.
+//
+// All ranked, accepted candidates are marked (in rank order) so the caller
+// can build Playwright Locators for each and try them in order — see
+// attemptBoundedCandidateDismissal(). Rejected candidates are still
+// reported (capped) for diagnostics, with a reason.
+const findStrathberryCloseCandidatesFn = new Function(
   "args",
   `
   var overlayAttr = args.overlayAttr;
-  var closeAttr = args.closeAttr;
+  var markAttr = args.markAttr;
   var excludeFragments = args.excludeFragments;
   var container = document.querySelector('[' + overlayAttr + '="true"]');
-  if (!container) return { inspectedCount: 0, candidates: [], found: false };
+  if (!container) return { visualX: null, candidates: [], candidateCount: 0, found: false };
 
   var containerRect = container.getBoundingClientRect();
   var marginX = Math.max(24, containerRect.width * 0.25);
@@ -302,81 +333,202 @@ const findStrathberryTopRightIconFn = new Function(
     return false;
   }
 
-  var all = container.querySelectorAll('*');
-  var inspectedCount = 0;
-  var topRightSmall = [];
+  function relativeRect(rect) {
+    return {
+      top: rect.top - containerRect.top,
+      left: rect.left - containerRect.left,
+      right: rect.right - containerRect.left,
+      bottom: rect.bottom - containerRect.top,
+      width: rect.width,
+      height: rect.height
+    };
+  }
 
+  // --- (A) Visual X discovery — same top-right/small/no-CTA-text
+  // heuristic as before, used only to locate the icon area, not to decide
+  // the click target.
+  var all = container.querySelectorAll('*');
+  var topRightSmall = [];
   for (var i = 0; i < all.length; i++) {
     var el = all[i];
     if (!isVisible(el)) continue;
-    inspectedCount++;
-
     var rect = el.getBoundingClientRect();
     if (rect.width > 60 || rect.height > 60) continue;
-
     var isTopRight = rect.right >= containerRect.right - marginX && rect.top <= containerRect.top + marginY;
     if (!isTopRight) continue;
-
     var tag = el.tagName ? el.tagName.toLowerCase() : '';
     var ariaLabel = el.getAttribute('aria-label');
     var titleAttr = el.getAttribute('title');
     var text = (el.innerText || '').trim();
     var accessibleText = (ariaLabel || titleAttr || text || '').trim();
-    var hasSvgDescendant = tag === 'svg' || tag === 'path' || el.querySelectorAll('svg, path').length > 0;
+    var hasSvgOrPath = tag === 'svg' || tag === 'path' || el.querySelectorAll('svg, path').length > 0;
+    var excludedHere = accessibleText.length > 3 || containsExcludedText(accessibleText) || containsExcludedText(text);
+    if (excludedHere) continue;
+    topRightSmall.push({ el: el, tag: tag, rect: rect, hasSvgOrPath: hasSvgOrPath, area: rect.width * rect.height });
+  }
+  var withSvg = topRightSmall.filter(function (c) { return c.hasSvgOrPath; });
+  var pool = withSvg.length > 0 ? withSvg : topRightSmall;
+  pool.sort(function (a, b) { return a.area - b.area; });
+  var visualX = pool.length > 0 ? pool[0] : null;
 
-    var excluded = accessibleText.length > 3 || containsExcludedText(accessibleText) || containsExcludedText(text);
+  if (!visualX) {
+    return { visualX: null, candidates: [], candidateCount: 0, found: false };
+  }
 
-    topRightSmall.push({
-      el: el,
-      tag: tag,
-      text: text,
-      ariaLabel: ariaLabel,
-      title: titleAttr,
-      rect: {
-        top: rect.top - containerRect.top,
-        left: rect.left - containerRect.left,
-        right: rect.right - containerRect.left,
-        bottom: rect.bottom - containerRect.top,
-        width: rect.width,
-        height: rect.height
-      },
-      hasSvgDescendant: hasSvgDescendant,
-      excluded: excluded,
-      area: rect.width * rect.height
+  // --- (B) Click-target resolution — walk from the visual X up to (but
+  // not including) the confirmed overlay container, ranking each node.
+  function rankOf(el) {
+    var tag = el.tagName.toLowerCase();
+    if (tag === 'button') return 1;
+    if (el.getAttribute('role') === 'button') return 2;
+    if (tag === 'a') return 3;
+    if (el.hasAttribute('onclick')) return 4;
+    if (el.hasAttribute('tabindex')) return 5;
+    if (window.getComputedStyle(el).cursor === 'pointer') return 6;
+    if (tag === 'svg') return 7;
+    if (tag === 'path') return 9;
+    return 8;
+  }
+
+  var chain = [];
+  var node = visualX.el;
+  var depth = 0;
+  while (node && node !== container) {
+    chain.push({ el: node, depth: depth });
+    node = node.parentElement;
+    depth++;
+  }
+
+  var raw = [];
+  for (var c = 0; c < chain.length; c++) {
+    var entry = chain[c];
+    var cEl = entry.el;
+    var cRect = cEl.getBoundingClientRect();
+    var cTag = cEl.tagName.toLowerCase();
+    var cRole = cEl.getAttribute('role');
+    var cAriaLabel = cEl.getAttribute('aria-label');
+    var cTitle = cEl.getAttribute('title');
+    var cHasTabIndex = cEl.hasAttribute('tabindex');
+    var cHasOnClick = cEl.hasAttribute('onclick');
+    var cStyle = window.getComputedStyle(cEl);
+    var cCursor = cStyle.cursor;
+    var cPointerEvents = cStyle.pointerEvents;
+    var cText = (cEl.innerText || '').trim();
+    var cAccessibleText = (cAriaLabel || cTitle || cText || '').trim();
+    var cHasSvgOrPath = cTag === 'svg' || cTag === 'path' || cEl.querySelectorAll('svg, path').length > 0;
+
+    var rejectReason = null;
+    if (cRect.width === 0 || cRect.height === 0) {
+      rejectReason = 'not visible / zero-size';
+    } else if (cRect.width > 80 || cRect.height > 80) {
+      rejectReason = 'too large to be the X control';
+    } else if (cAccessibleText.length > 3 && !cHasSvgOrPath) {
+      rejectReason = 'meaningful text, not an icon wrapper';
+    } else if (containsExcludedText(cAccessibleText) || containsExcludedText(cText)) {
+      rejectReason = 'contains excluded CTA/country wording';
+    } else {
+      var cIsTopRight = cRect.right >= containerRect.right - marginX && cRect.top <= containerRect.top + marginY;
+      if (!cIsTopRight) rejectReason = 'not in the overlay top-right close area';
+    }
+
+    raw.push({
+      el: cEl,
+      tag: cTag,
+      rect: relativeRect(cRect),
+      role: cRole,
+      ariaLabel: cAriaLabel,
+      title: cTitle,
+      hasTabIndex: cHasTabIndex,
+      cursor: cCursor,
+      pointerEvents: cPointerEvents,
+      hasOnClick: cHasOnClick,
+      text: cText,
+      hasSvgOrPath: cHasSvgOrPath,
+      relationship: entry.depth === 0 ? 'self' : ('ancestor depth ' + entry.depth),
+      rank: rankOf(cEl),
+      accepted: !rejectReason,
+      rejectReason: rejectReason,
+      area: cRect.width * cRect.height
     });
   }
 
-  var eligible = topRightSmall.filter(function (c) { return !c.excluded; });
-  var withSvg = eligible.filter(function (c) { return c.hasSvgDescendant; });
-  var pool = withSvg.length > 0 ? withSvg : eligible;
-  pool.sort(function (a, b) { return a.area - b.area; });
-  var best = pool.length > 0 ? pool[0] : null;
-
-  var found = false;
-  if (best) {
-    best.el.setAttribute(closeAttr, 'true');
-    found = true;
+  var accepted = raw.filter(function (c) { return c.accepted; });
+  accepted.sort(function (a, b) {
+    if (a.rank !== b.rank) return a.rank - b.rank;
+    return a.area - b.area;
+  });
+  for (var m = 0; m < accepted.length; m++) {
+    accepted[m].el.setAttribute(markAttr, String(m));
   }
 
-  var diagnosticSource = topRightSmall.slice(0, 20);
-  var candidates = [];
+  var diagnosticSource = raw.slice(0, 15);
+  var candidatesOut = [];
   for (var d = 0; d < diagnosticSource.length; d++) {
     var dc = diagnosticSource[d];
-    candidates.push({
+    candidatesOut.push({
       tag: dc.tag,
-      text: dc.text,
+      rect: dc.rect,
+      role: dc.role,
       ariaLabel: dc.ariaLabel,
       title: dc.title,
-      rect: dc.rect,
-      hasSvgDescendant: dc.hasSvgDescendant,
-      excluded: dc.excluded,
-      chosen: best === dc
+      hasTabIndex: dc.hasTabIndex,
+      cursor: dc.cursor,
+      pointerEvents: dc.pointerEvents,
+      hasOnClick: dc.hasOnClick,
+      text: dc.text,
+      hasSvgOrPath: dc.hasSvgOrPath,
+      relationship: dc.relationship,
+      rank: dc.rank,
+      accepted: dc.accepted,
+      rejectReason: dc.rejectReason,
+      order: accepted.indexOf(dc)
     });
   }
 
-  return { inspectedCount: inspectedCount, candidates: candidates, found: found };
+  return {
+    visualX: { tag: visualX.tag, rect: relativeRect(visualX.rect) },
+    candidates: candidatesOut,
+    candidateCount: accepted.length,
+    found: accepted.length > 0
+  };
   `
-) as unknown as BrowserFn<StrathberryFallbackArgs, StrathberryFallbackResult>;
+) as unknown as BrowserFn<StrathberryResolveArgs, StrathberryResolveResult>;
+
+// Precise check on the specific confirmed overlay element (attached AND
+// visible), not a full-page text rescan — used by the bounded Strathberry
+// dismissal verification below because a click can succeed while other,
+// unrelated region-signal text still lingers momentarily elsewhere on the
+// page (e.g. mid-animation), which would otherwise read as a false
+// "still visible".
+const isMarkedOverlayVisibleFn = new Function(
+  "attr",
+  `
+  var el = document.querySelector('[' + attr + '="true"]');
+  if (!el) return false;
+  var rect = el.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return false;
+  var style = window.getComputedStyle(el);
+  if (style.visibility === 'hidden' || style.display === 'none') return false;
+  if (parseFloat(style.opacity) === 0) return false;
+  return true;
+  `
+) as unknown as BrowserFn<string, boolean>;
+
+// Bounded secondary click strategy, used only when a real Playwright click
+// on the resolved target fails (e.g. intercepted). Dispatches a plain
+// element.click() on the EXACT SAME marked element — never a different
+// element, never page coordinates.
+const dispatchClickOnMarkedFn = new Function(
+  "args",
+  `
+  var attr = args.attr;
+  var value = args.value;
+  var el = document.querySelector('[' + attr + '="' + value + '"]');
+  if (!el) return false;
+  el.click();
+  return true;
+  `
+) as unknown as BrowserFn<{ attr: string; value: string }, boolean>;
 
 // Exposed only so the regression test can exercise exactly what gets
 // shipped to the browser (see scripts/lib/region.browser-eval.test.ts).
@@ -386,7 +538,9 @@ export const __browserEvalPayloads = {
   isRegionSignalVisibleFn,
   findOverlayCandidateFn,
   findStructuralCloseControlFn,
-  findStrathberryTopRightIconFn,
+  findStrathberryCloseCandidatesFn,
+  isMarkedOverlayVisibleFn,
+  dispatchClickOnMarkedFn,
 };
 
 // Exported (unchanged logic) so the capture orchestrator can poll it for a
@@ -468,27 +622,111 @@ async function findCloseControl(
   return { control: null, strategy: "none-found" };
 }
 
-function logStrathberryFallbackDiagnostics(
-  inspectedCount: number,
-  candidates: StrathberryCloseCandidateDiagnostic[]
-): void {
-  console.log(`Strathberry fallback: elements inspected inside overlay: ${inspectedCount}`);
-  console.log(`Strathberry fallback: top-right candidates found: ${candidates.length}`);
-  if (candidates.length === 0) {
-    console.log("Strathberry fallback: candidate: none found within overlay");
-    return;
-  }
-  for (const c of candidates) {
+function logStrathberryResolutionDiagnostics(resolution: StrathberryResolveResult): void {
+  if (resolution.visualX) {
     console.log(
-      `Strathberry fallback: candidate: tag=${c.tag} text=${JSON.stringify(
-        c.text
-      )} ariaLabel=${JSON.stringify(c.ariaLabel)} title=${JSON.stringify(
-        c.title
-      )} rect=${JSON.stringify(c.rect)} hasSvgDescendant=${c.hasSvgDescendant} excluded=${c.excluded} chosen=${
-        c.chosen
-      }`
+      `Strathberry visual X: tag=${resolution.visualX.tag} rect=${JSON.stringify(resolution.visualX.rect)}`
+    );
+  } else {
+    console.log("Strathberry visual X: none found within overlay");
+  }
+  console.log(`Strathberry close candidates inspected: ${resolution.candidates.length}`);
+  for (const c of resolution.candidates) {
+    console.log(
+      `Strathberry close candidate: tag=${c.tag} relationship=${c.relationship} rank=${c.rank} ` +
+        `rect=${JSON.stringify(c.rect)} role=${JSON.stringify(c.role)} ariaLabel=${JSON.stringify(
+          c.ariaLabel
+        )} title=${JSON.stringify(c.title)} tabindex=${c.hasTabIndex} cursor=${c.cursor} ` +
+        `pointerEvents=${c.pointerEvents} onclick=${c.hasOnClick} text=${JSON.stringify(
+          c.text
+        )} hasSvgOrPath=${c.hasSvgOrPath} accepted=${c.accepted}` +
+        `${c.rejectReason ? ` rejectReason=${JSON.stringify(c.rejectReason)}` : ""} order=${c.order}`
     );
   }
+}
+
+// Precise "is the confirmed overlay actually gone" check used only by the
+// bounded Strathberry retry below: checks the specific marked overlay
+// element first (hidden or detached), falling back to the existing,
+// unmodified isRegionSignalVisible() as a second signal — never relying on
+// only one text node disappearing.
+async function isStrathberryOverlayGone(page: Page): Promise<boolean> {
+  const overlayElementStillVisible = await page.evaluate(isMarkedOverlayVisibleFn, OVERLAY_MARK_ATTR);
+  if (overlayElementStillVisible) return false;
+  return !(await isRegionSignalVisible(page));
+}
+
+export type BoundedCandidateDismissDeps = {
+  candidateCount: number;
+  // Real Playwright click on the resolved candidate at `index`. Must never
+  // use force:true as a first attempt.
+  click: (index: number) => Promise<{ success: boolean; error?: string }>;
+  // Bounded secondary strategy, confined to the SAME candidate — never a
+  // different element, never page coordinates.
+  dispatchSecondaryClick: (index: number) => Promise<void>;
+  isOverlayGone: () => Promise<boolean>;
+  sleep: (ms: number) => Promise<void>;
+  log?: (message: string) => void;
+  maxAttempts?: number;
+  verifyPollIntervalMs?: number;
+  verifyPollAttempts?: number;
+  reappearCheckDelayMs?: number;
+  candidateDescription?: (index: number) => string;
+};
+
+/**
+ * Pure, injectable bounded-retry algorithm (no Page dependency, so it's
+ * directly unit-testable): tries each resolved click-target candidate, in
+ * rank order, up to a small bound. After each attempt it polls — bounded,
+ * ~2s by default — for the overlay to disappear, then re-checks shortly
+ * after in case it reappears. Stops immediately on the first candidate
+ * that produces a genuine, stable dismissal.
+ */
+export async function attemptBoundedCandidateDismissal(
+  deps: BoundedCandidateDismissDeps
+): Promise<boolean> {
+  const maxAttempts = Math.min(deps.candidateCount, deps.maxAttempts ?? 4);
+  const verifyPollIntervalMs = deps.verifyPollIntervalMs ?? 400;
+  const verifyPollAttempts = deps.verifyPollAttempts ?? 4;
+  const reappearCheckDelayMs = deps.reappearCheckDelayMs ?? 400;
+  const log = deps.log ?? (() => {});
+
+  for (let i = 0; i < maxAttempts; i++) {
+    const description = deps.candidateDescription ? deps.candidateDescription(i) : `candidate${i}`;
+    const clickOutcome = await deps.click(i);
+
+    let secondaryDispatchAttempted = false;
+    if (!clickOutcome.success) {
+      secondaryDispatchAttempted = true;
+      await deps.dispatchSecondaryClick(i);
+    }
+
+    let gone = await deps.isOverlayGone();
+    for (let poll = 0; !gone && poll < verifyPollAttempts; poll++) {
+      await deps.sleep(verifyPollIntervalMs);
+      gone = await deps.isOverlayGone();
+    }
+
+    let reappeared = false;
+    if (gone) {
+      await deps.sleep(reappearCheckDelayMs);
+      reappeared = !(await deps.isOverlayGone());
+    }
+
+    log(
+      `Strathberry click attempt ${i + 1}: target=${description} playwrightClickAttempted=true ` +
+        `clickResult=${clickOutcome.success ? "success" : "failed"}` +
+        `${clickOutcome.error ? ` error=${JSON.stringify(clickOutcome.error)}` : ""} ` +
+        `secondaryDispatchAttempted=${secondaryDispatchAttempted} modalDisappeared=${gone && !reappeared} ` +
+        `modalReappeared=${reappeared}`
+    );
+
+    if (gone && !reappeared) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -496,27 +734,66 @@ function logStrathberryFallbackDiagnostics(
  * above return none-found, AND only when all of the following already
  * hold: a region overlay was positively identified, UK storefront evidence
  * was positively found, and the overlay's own matched signals include the
- * Strathberry "Shopping To ..." wording specifically (not just some other
- * generic region signal). It never searches outside the confirmed overlay.
- * See findStrathberryTopRightIconFn above for the selection logic.
+ * Strathberry "Shopping To ..." / "Shipping To ..." wording specifically
+ * (not just some other generic region signal). It never searches outside
+ * the confirmed overlay, never touches the country picker, and never
+ * clicks SHOP NOW. Thin real-Page wrapper around
+ * findStrathberryCloseCandidatesFn (discovery + resolution) and
+ * attemptBoundedCandidateDismissal (bounded retry + verification).
  */
-async function findStrathberryTopRightIconCloseControl(
-  page: Page
-): Promise<Locator | null> {
-  await page.evaluate(clearMarksFn, CLOSE_MARK_ATTR);
+async function attemptStrathberryDismissal(page: Page): Promise<boolean> {
+  await page.evaluate(clearMarksFn, STRATHBERRY_CANDIDATE_MARK_ATTR);
 
-  const { inspectedCount, candidates, found } = await page.evaluate(
-    findStrathberryTopRightIconFn,
-    {
-      overlayAttr: OVERLAY_MARK_ATTR,
-      closeAttr: CLOSE_MARK_ATTR,
-      excludeFragments: STRATHBERRY_FALLBACK_EXCLUDE_FRAGMENTS,
-    }
-  );
-  logStrathberryFallbackDiagnostics(inspectedCount, candidates);
+  const resolution = await page.evaluate(findStrathberryCloseCandidatesFn, {
+    overlayAttr: OVERLAY_MARK_ATTR,
+    markAttr: STRATHBERRY_CANDIDATE_MARK_ATTR,
+    excludeFragments: STRATHBERRY_FALLBACK_EXCLUDE_FRAGMENTS,
+  });
+  logStrathberryResolutionDiagnostics(resolution);
 
-  if (!found) return null;
-  return page.locator(`[${CLOSE_MARK_ATTR}="true"]`).first();
+  if (!resolution.found || resolution.candidateCount === 0) {
+    return false;
+  }
+
+  const acceptedByOrder = resolution.candidates
+    .filter((c) => c.accepted && c.order >= 0)
+    .sort((a, b) => a.order - b.order);
+
+  return attemptBoundedCandidateDismissal({
+    candidateCount: resolution.candidateCount,
+    candidateDescription: (index) => {
+      const c = acceptedByOrder[index];
+      return c ? `candidate${index}(tag=${c.tag}, relationship=${c.relationship})` : `candidate${index}`;
+    },
+    click: async (index) => {
+      try {
+        await page
+          .locator(`[${STRATHBERRY_CANDIDATE_MARK_ATTR}="${index}"]`)
+          .first()
+          .click({ timeout: 1200 });
+        return { success: true };
+      } catch (err) {
+        return {
+          success: false,
+          error: err instanceof Error ? err.message.split("\n")[0] : String(err),
+        };
+      }
+    },
+    dispatchSecondaryClick: async (index) => {
+      try {
+        await page.evaluate(dispatchClickOnMarkedFn, {
+          attr: STRATHBERRY_CANDIDATE_MARK_ATTR,
+          value: String(index),
+        });
+      } catch {
+        // No further fallback — the bounded loop moves on to the next
+        // candidate (or gives up) based on the verification check below.
+      }
+    },
+    isOverlayGone: () => isStrathberryOverlayGone(page),
+    sleep: (ms) => page.waitForTimeout(ms),
+    log: (message) => console.log(message),
+  });
 }
 
 // The gate deciding whether the Strathberry-specific fallback above may
@@ -597,7 +874,7 @@ export async function confirmUkRegion(page: Page): Promise<RegionResult> {
     return { regionStatus: "could-not-confirm", detectedStore, detectedCurrency };
   }
 
-  let { control: closeControl, strategy } = await findCloseControl(
+  const { control: closeControl, strategy } = await findCloseControl(
     page,
     overlay.locator
   );
@@ -606,23 +883,27 @@ export async function confirmUkRegion(page: Page): Promise<RegionResult> {
   // once the generic strategies have already failed and only when this is
   // genuinely the "Shopping To ...?" / "Shipping To ...?" overlay (not some
   // other unrelated region signal) with UK storefront evidence already
-  // confirmed above. See strathberryFallbackAppliesTo() for the gate.
+  // confirmed above. See strathberryFallbackAppliesTo() for the gate, and
+  // attemptStrathberryDismissal() for the bounded, multi-candidate
+  // click-target resolution/execution/verification.
   if (!closeControl) {
     if (strathberryFallbackAppliesTo(overlay.matchedPatterns)) {
-      const strathberryControl = await findStrathberryTopRightIconCloseControl(page);
-      if (strathberryControl) {
-        closeControl = strathberryControl;
-        strategy = "strathberry-top-right-icon-fallback";
-      }
+      console.log("Close control strategy: strathberry-top-right-icon-fallback");
+      const dismissed = await attemptStrathberryDismissal(page);
+      console.log(`Dismissal verified: ${dismissed}`);
+      return {
+        regionStatus: dismissed ? "uk-modal-dismissed" : "could-not-confirm",
+        detectedStore,
+        detectedCurrency,
+      };
     }
-  }
 
-  console.log(`Close control strategy: ${strategy}`);
-
-  if (!closeControl) {
+    console.log(`Close control strategy: ${strategy}`);
     console.log("Dismissal verified: false");
     return { regionStatus: "could-not-confirm", detectedStore, detectedCurrency };
   }
+
+  console.log(`Close control strategy: ${strategy}`);
 
   try {
     await closeControl.click({ timeout: 3000 });

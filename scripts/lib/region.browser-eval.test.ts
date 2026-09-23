@@ -17,9 +17,14 @@
  */
 import assert from "node:assert/strict";
 import vm from "node:vm";
-import { __browserEvalPayloads, strathberryFallbackAppliesTo } from "./region";
+import {
+  __browserEvalPayloads,
+  strathberryFallbackAppliesTo,
+  attemptBoundedCandidateDismissal,
+  type StrathberryCandidateDiagnostic,
+} from "./region";
 
-type FakeStyle = { visibility: string; display: string; opacity: string };
+type FakeStyle = { visibility: string; display: string; opacity: string; cursor: string; pointerEvents: string };
 type FakeRect = { top: number; left: number; right: number; bottom: number; width: number; height: number };
 
 class FakeElement {
@@ -29,6 +34,7 @@ class FakeElement {
   private rect: FakeRect;
   style: FakeStyle;
   children: FakeElement[];
+  parentElement: FakeElement | null = null;
 
   constructor(
     tagName: string,
@@ -52,7 +58,14 @@ class FakeElement {
       height: 50,
       ...(opts.rect ?? {}),
     };
-    this.style = { visibility: "visible", display: "block", opacity: "1", ...(opts.style ?? {}) };
+    this.style = {
+      visibility: "visible",
+      display: "block",
+      opacity: "1",
+      cursor: "auto",
+      pointerEvents: "auto",
+      ...(opts.style ?? {}),
+    };
     this.children = opts.children ?? [];
   }
 
@@ -79,6 +92,10 @@ class FakeElement {
 
   hasAttr(name: string): boolean {
     return Object.prototype.hasOwnProperty.call(this.attrs, name);
+  }
+
+  hasAttribute(name: string): boolean {
+    return this.hasAttr(name);
   }
 
   hide() {
@@ -146,6 +163,16 @@ function makeFakeDocument(body: FakeElement) {
   };
 }
 
+// Wires up .parentElement across the whole tree (needed for the ancestor
+// walk in findStrathberryCloseCandidatesFn) — FakeElement's constructor
+// builds children bottom-up, so this is done as a separate pass.
+function linkParents(root: FakeElement): void {
+  for (const child of root.children) {
+    child.parentElement = root;
+    linkParents(child);
+  }
+}
+
 /**
  * Reconstructs a `new Function(...)`-built payload exactly the way
  * Playwright reconstructs a function it ships to the browser: stringify,
@@ -210,66 +237,98 @@ function buildStrathberryOverlayFixture() {
  * "Yes" chip, and an unrelated close X entirely outside the modal) to
  * prove the fallback never picks any of them.
  */
-function buildStrathberryFallbackFixture() {
-  const svgIcon = new FakeElement("svg", {
-    rect: { top: 12, left: 272, right: 288, bottom: 28, width: 16, height: 16 },
-    children: [new FakeElement("path")],
-  });
-  // No attrs at all: no role, no aria-label, no title, no tabindex, no
-  // onclick — exactly the live DOM shape that defeated the generic
-  // structural fallback.
-  const iconWrapper = new FakeElement("div", {
-    rect: { top: 4, left: 260, right: 296, bottom: 40, width: 36, height: 36 },
-    children: [svgIcon],
-  });
-  const shopNowButton = new FakeElement("button", {
-    text: "SHOP NOW",
-    rect: { top: 200, left: 20, right: 280, bottom: 240, width: 260, height: 40 },
-  });
-  const countryRow = new FakeElement("div", {
-    text: "United States",
-    rect: { top: 120, left: 20, right: 280, bottom: 160, width: 260, height: 40 },
-  });
-  // Small, top-right-ish decoy with real CTA-like text, to prove the
-  // exclusion-fragment check (not just size/position) is actually doing
-  // work, not merely relying on SHOP NOW/country row being too large.
-  const decoyYesChip = new FakeElement("span", {
-    text: "Yes",
-    rect: { top: 6, left: 230, right: 256, bottom: 30, width: 26, height: 24 },
-  });
+const OVERLAY_ATTR = "data-kl-region-overlay";
+const STRATHBERRY_CANDIDATE_ATTR = "data-kl-region-close-candidate";
+const STRATHBERRY_EXCLUDE_FRAGMENTS = ["shop now", "united states", "continue", "yes", "country", "dropdown"];
+
+/**
+ * Builds a confirmed Strathberry-style region modal (heading + UK
+ * confirmation text + optional SHOP NOW / country row / decoy "Yes" chip),
+ * with a given close-target subtree inserted, and optionally an unrelated
+ * close "X" living outside the modal (e.g. a site header close button) to
+ * prove the resolution never leaves the confirmed overlay boundary.
+ */
+function buildStrathberryModal(opts: {
+  closeTarget?: FakeElement;
+  includeShopNow?: boolean;
+  includeCountryRow?: boolean;
+  includeDecoyYes?: boolean;
+  includeHeaderX?: boolean;
+}) {
+  const shopNowButton =
+    opts.includeShopNow !== false
+      ? new FakeElement("button", {
+          text: "SHOP NOW",
+          rect: { top: 200, left: 20, right: 280, bottom: 240, width: 260, height: 40 },
+        })
+      : null;
+  const countryRow =
+    opts.includeCountryRow !== false
+      ? new FakeElement("div", {
+          text: "United States",
+          rect: { top: 120, left: 20, right: 280, bottom: 160, width: 260, height: 40 },
+        })
+      : null;
+  const decoyYesChip = opts.includeDecoyYes
+    ? new FakeElement("span", {
+        text: "Yes",
+        rect: { top: 6, left: 230, right: 256, bottom: 30, width: 26, height: 24 },
+      })
+    : null;
+
+  const children: FakeElement[] = [
+    new FakeElement("h2", { text: "Shopping To United States?" }),
+    new FakeElement("p", { text: "You are currently browsing our United Kingdom store." }),
+  ];
+  if (countryRow) children.push(countryRow);
+  if (shopNowButton) children.push(shopNowButton);
+  if (decoyYesChip) children.push(decoyYesChip);
+  if (opts.closeTarget) children.push(opts.closeTarget);
+
   const overlayPanel = new FakeElement("div", {
     rect: { top: 0, left: 0, right: 300, bottom: 260, width: 300, height: 260 },
-    children: [
-      new FakeElement("h2", { text: "Shopping To United States?" }),
-      new FakeElement("p", { text: "You are currently browsing our United Kingdom store." }),
-      countryRow,
-      shopNowButton,
-      decoyYesChip,
-      iconWrapper,
-    ],
+    children,
   });
-  // An unrelated close "X" that happens to exist elsewhere on the page
-  // (e.g. a nav/menu close button), positioned well outside the overlay's
-  // bounds and NOT a descendant of it — the fallback must never touch it.
-  const unrelatedPageX = new FakeElement("button", {
-    attrs: { "aria-label": "Close" },
-    rect: { top: 4, left: 760, right: 796, bottom: 40, width: 36, height: 36 },
-  });
-  const header = new FakeElement("header", { text: "Strathberry" });
-  const body = new FakeElement("body", { children: [header, overlayPanel, unrelatedPageX] });
-  return {
-    body,
-    overlayPanel,
-    iconWrapper,
-    svgIcon,
-    shopNowButton,
-    countryRow,
-    decoyYesChip,
-    unrelatedPageX,
-  };
+
+  const bodyChildren = [new FakeElement("header", { text: "Strathberry" }), overlayPanel];
+  let headerX: FakeElement | null = null;
+  if (opts.includeHeaderX) {
+    // A separate close "X" living in the site header, well outside the
+    // modal — must never be selected.
+    headerX = new FakeElement("button", {
+      attrs: { "aria-label": "Close" },
+      rect: { top: 4, left: 760, right: 796, bottom: 40, width: 36, height: 36 },
+    });
+    bodyChildren.push(headerX);
+  }
+
+  const body = new FakeElement("body", { children: bodyChildren });
+  linkParents(body);
+  overlayPanel.setAttribute(OVERLAY_ATTR, "true");
+
+  return { body, overlayPanel, shopNowButton, countryRow, decoyYesChip, headerX };
 }
 
-function run() {
+function resolveStrathberryCandidates(body: FakeElement) {
+  const document = makeFakeDocument(body);
+  const findCandidates = reconstructInBrowserLikeSandbox(
+    __browserEvalPayloads.findStrathberryCloseCandidatesFn,
+    document
+  );
+  return findCandidates({
+    overlayAttr: OVERLAY_ATTR,
+    markAttr: STRATHBERRY_CANDIDATE_ATTR,
+    excludeFragments: STRATHBERRY_EXCLUDE_FRAGMENTS,
+  });
+}
+
+function acceptedOrderZero(
+  candidates: StrathberryCandidateDiagnostic[]
+): StrathberryCandidateDiagnostic | undefined {
+  return candidates.find((c) => c.order === 0);
+}
+
+async function run() {
   console.log("Running region.ts browser-evaluation regression tests...");
 
   // 1. isRegionSignalVisibleFn: detects the overlay text, and correctly
@@ -349,95 +408,248 @@ function run() {
     console.log("  ok: findStructuralCloseControlFn (picks the icon-only control, not SHOP NOW)");
   }
 
-  // 3b. findStrathberryTopRightIconFn: the last-resort Strathberry fallback,
-  //     for the live DOM shape where even the generic structural fallback
-  //     fails — an SVG icon in a plain <div> with no button/role/aria-label/
-  //     title/tabindex/onclick/cursor:pointer at all.
+  // 3b. findStrathberryCloseCandidatesFn: click-target resolution across
+  //     multiple plausible live DOM shapes. Root cause of the previous live
+  //     failure: the old implementation always picked the smallest visible
+  //     SVG/path node — here that would mean picking the tiny <path>, which
+  //     is what happened live (chosen=true on a ~10x6px path) and did not
+  //     reliably dismiss the modal. These fixtures prove rank (not size) is
+  //     the primary rule, with size only breaking ties within the same rank.
+
+  // Fixture 1: DIV wrapper (cursor:pointer) > SVG > PATH, PATH smaller than
+  // SVG. Expected: the wrapper is picked (cursor:pointer outranks a bare
+  // SVG or its path), not the path.
   {
-    const {
-      body,
-      overlayPanel,
-      iconWrapper,
-      svgIcon,
-      shopNowButton,
-      countryRow,
-      decoyYesChip,
-      unrelatedPageX,
-    } = buildStrathberryFallbackFixture();
-    overlayPanel.setAttribute("data-kl-region-overlay", "true");
-    const document = makeFakeDocument(body);
-
-    // 1. Prove the generic structural fallback genuinely fails on this
-    //    fixture first (it only looks at button/[role=button]/a, and the
-    //    icon wrapper here is a plain, attribute-less <div>).
-    const findStructuralCloseControl = reconstructInBrowserLikeSandbox(
-      __browserEvalPayloads.findStructuralCloseControlFn,
-      document
-    );
-    const genericFound = findStructuralCloseControl({
-      overlayAttr: "data-kl-region-overlay",
-      closeAttr: "data-kl-region-close",
+    const path = new FakeElement("path", {
+      rect: { top: 18, left: 283, right: 293, bottom: 24, width: 10, height: 6 },
     });
-    assert.equal(genericFound, false, "the generic structural fallback must fail on this fixture");
-
-    // 2. The Strathberry-specific fallback must find it instead.
-    const findStrathberryTopRightIcon = reconstructInBrowserLikeSandbox(
-      __browserEvalPayloads.findStrathberryTopRightIconFn,
-      document
-    );
-    const result = findStrathberryTopRightIcon({
-      overlayAttr: "data-kl-region-overlay",
-      closeAttr: "data-kl-strathberry-close",
-      excludeFragments: ["shop now", "united states", "continue", "yes", "country", "dropdown"],
+    const svg = new FakeElement("svg", {
+      rect: { top: 14, left: 280, right: 296, bottom: 30, width: 16, height: 16 },
+      children: [path],
     });
+    const wrapper = new FakeElement("div", {
+      style: { cursor: "pointer" },
+      rect: { top: 4, left: 260, right: 296, bottom: 40, width: 36, height: 36 },
+      children: [svg],
+    });
+    const { body, shopNowButton, countryRow } = buildStrathberryModal({ closeTarget: wrapper });
+    const result = resolveStrathberryCandidates(body);
+    const top = acceptedOrderZero(result.candidates);
+    assert.equal(result.found, true, "Fixture 1: expected a candidate to be found");
+    assert.equal(wrapper.getAttribute(STRATHBERRY_CANDIDATE_ATTR), "0", "Fixture 1: wrapper must be the top pick");
+    assert.notEqual(path.getAttribute(STRATHBERRY_CANDIDATE_ATTR), "0", "Fixture 1: PATH must never be the top-ranked pick");
+    assert.equal(top?.tag, "div");
+    assert.equal(shopNowButton?.getAttribute(STRATHBERRY_CANDIDATE_ATTR), null);
+    assert.equal(countryRow?.getAttribute(STRATHBERRY_CANDIDATE_ATTR), null);
+    console.log("  ok: Fixture 1 (cursor:pointer wrapper beats its smaller SVG/PATH descendants)");
+  }
 
-    assert.equal(result.found, true, "the Strathberry fallback must find the icon/wrapper close control");
-    const markedOnIcon = svgIcon.getAttribute("data-kl-strathberry-close") === "true";
-    const markedOnWrapper = iconWrapper.getAttribute("data-kl-strathberry-close") === "true";
-    assert.ok(markedOnIcon || markedOnWrapper, "expected the SVG icon or its wrapper to be marked as the close control");
+  // Fixture 2: BUTTON > SVG > PATH. Expected: the button is picked.
+  {
+    const path = new FakeElement("path", {
+      rect: { top: 18, left: 283, right: 293, bottom: 24, width: 10, height: 6 },
+    });
+    const svg = new FakeElement("svg", {
+      rect: { top: 14, left: 280, right: 296, bottom: 30, width: 16, height: 16 },
+      children: [path],
+    });
+    const button = new FakeElement("button", {
+      rect: { top: 4, left: 260, right: 296, bottom: 40, width: 36, height: 36 },
+      children: [svg],
+    });
+    const { body } = buildStrathberryModal({ closeTarget: button });
+    const result = resolveStrathberryCandidates(body);
+    assert.equal(button.getAttribute(STRATHBERRY_CANDIDATE_ATTR), "0", "Fixture 2: the <button> must be picked");
+    assert.notEqual(path.getAttribute(STRATHBERRY_CANDIDATE_ATTR), "0");
+    assert.equal(result.found, true);
+    console.log("  ok: Fixture 2 (explicit <button> always wins)");
+  }
 
-    // 3-5. Never SHOP NOW, never United States, never the unrelated
-    //      page-level close X outside the modal.
-    assert.equal(shopNowButton.getAttribute("data-kl-strathberry-close"), null, "must never select SHOP NOW");
-    assert.equal(countryRow.getAttribute("data-kl-strathberry-close"), null, "must never select United States");
-    assert.equal(
-      decoyYesChip.getAttribute("data-kl-strathberry-close"),
-      null,
-      "must never select a small CTA-like 'Yes' chip"
-    );
-    assert.equal(
-      unrelatedPageX.getAttribute("data-kl-strathberry-close"),
-      null,
-      "must never select a close X outside the confirmed overlay"
-    );
+  // Fixture 3: a bare interactive SVG > PATH, no wrapper at all. Expected:
+  // the SVG is picked, not its PATH.
+  {
+    const path = new FakeElement("path", {
+      rect: { top: 18, left: 283, right: 293, bottom: 24, width: 10, height: 6 },
+    });
+    const svg = new FakeElement("svg", {
+      rect: { top: 4, left: 260, right: 296, bottom: 40, width: 36, height: 36 },
+      children: [path],
+    });
+    const { body } = buildStrathberryModal({ closeTarget: svg });
+    const result = resolveStrathberryCandidates(body);
+    assert.equal(svg.getAttribute(STRATHBERRY_CANDIDATE_ATTR), "0", "Fixture 3: the <svg> must be picked over its <path>");
+    assert.notEqual(path.getAttribute(STRATHBERRY_CANDIDATE_ATTR), "0");
+    assert.equal(result.found, true);
+    console.log("  ok: Fixture 3 (bare SVG beats its PATH)");
+  }
 
-    // Diagnostics: confirm elements were actually inspected and reported.
-    assert.ok(result.inspectedCount > 0, "expected at least one element to be reported as inspected");
-    assert.ok(result.candidates.length > 0, "expected at least one top-right candidate in diagnostics");
-    const chosenCandidates = result.candidates.filter((c) => c.chosen);
-    assert.equal(chosenCandidates.length, 1, "exactly one candidate should be marked chosen");
+  // Fixture 4: the exact live DOM shape that caused the original bug — a
+  // plain DIV (no cursor:pointer, no onclick, no tabindex, no role) > SVG >
+  // PATH. Expected: PATH must still not win merely for being smallest; the
+  // SVG (rank 7) outranks the generic wrapper (rank 8) and PATH (rank 9).
+  {
+    const path = new FakeElement("path", {
+      rect: { top: 18, left: 283, right: 293, bottom: 24, width: 10, height: 6 },
+    });
+    const svg = new FakeElement("svg", {
+      rect: { top: 14, left: 280, right: 296, bottom: 30, width: 16, height: 16 },
+      children: [path],
+    });
+    const wrapper = new FakeElement("div", {
+      // Deliberately NO cursor:pointer, NO onclick, NO tabindex, NO role —
+      // the live DOM shape that defeated the original smallest-wins logic.
+      rect: { top: 4, left: 260, right: 296, bottom: 40, width: 36, height: 36 },
+      children: [svg],
+    });
+    const { body } = buildStrathberryModal({ closeTarget: wrapper });
+    const result = resolveStrathberryCandidates(body);
+    const top = acceptedOrderZero(result.candidates);
+    assert.equal(result.found, true);
+    assert.notEqual(path.getAttribute(STRATHBERRY_CANDIDATE_ATTR), "0", "Fixture 4: PATH must never be picked purely for being smallest");
+    assert.ok(top && (top.tag === "svg" || top.tag === "div"), "Fixture 4: expected a safe SVG/wrapper pick, not PATH");
+    console.log("  ok: Fixture 4 (no explicit interactivity anywhere — PATH still not blindly preferred)");
+  }
 
-    // 6-7. Simulate the click's effect and confirm a full re-scan of the
-    //      page would now report the overlay gone — i.e. the orchestrator
-    //      (confirmUkRegion) would report "uk-modal-dismissed" here.
-    overlayPanel.hide();
-    const isRegionSignalVisibleAfter = reconstructInBrowserLikeSandbox(
-      __browserEvalPayloads.isRegionSignalVisibleFn,
-      document
-    );
-    assert.equal(
-      isRegionSignalVisibleAfter([
-        "shopping to",
-        "currently browsing our united kingdom store",
-        "shopping to united states",
-      ]),
-      false,
-      "after the click's effect, the region signal must no longer be visible (uk-modal-dismissed)"
-    );
+  // Fixture 8: SHOP NOW must never appear as a selectable candidate.
+  {
+    const wrapper = new FakeElement("div", {
+      style: { cursor: "pointer" },
+      rect: { top: 4, left: 260, right: 296, bottom: 40, width: 36, height: 36 },
+      children: [new FakeElement("svg", { children: [new FakeElement("path")] })],
+    });
+    const { body, shopNowButton } = buildStrathberryModal({ closeTarget: wrapper, includeShopNow: true });
+    resolveStrathberryCandidates(body);
+    assert.equal(shopNowButton?.getAttribute(STRATHBERRY_CANDIDATE_ATTR), null, "Fixture 8: SHOP NOW must never be selected");
+    console.log("  ok: Fixture 8 (SHOP NOW never selected)");
+  }
 
-    console.log(
-      "  ok: findStrathberryTopRightIconFn (generic fallback fails, Strathberry fallback finds the icon and not SHOP NOW/United States/decoys/unrelated X, dismissal verified)"
+  // Fixture 9: the United States / country row must never be selected.
+  {
+    const wrapper = new FakeElement("div", {
+      style: { cursor: "pointer" },
+      rect: { top: 4, left: 260, right: 296, bottom: 40, width: 36, height: 36 },
+      children: [new FakeElement("svg", { children: [new FakeElement("path")] })],
+    });
+    const { body, countryRow } = buildStrathberryModal({ closeTarget: wrapper, includeCountryRow: true });
+    resolveStrathberryCandidates(body);
+    assert.equal(countryRow?.getAttribute(STRATHBERRY_CANDIDATE_ATTR), null, "Fixture 9: country row must never be selected");
+    console.log("  ok: Fixture 9 (country dropdown/United States never selected)");
+  }
+
+  // Fixture 10: a separate close "X" in the site header, outside the
+  // confirmed modal, must never be selected — resolution never leaves the
+  // confirmed overlay boundary.
+  {
+    const wrapper = new FakeElement("div", {
+      style: { cursor: "pointer" },
+      rect: { top: 4, left: 260, right: 296, bottom: 40, width: 36, height: 36 },
+      children: [new FakeElement("svg", { children: [new FakeElement("path")] })],
+    });
+    const { body, headerX } = buildStrathberryModal({ closeTarget: wrapper, includeHeaderX: true });
+    resolveStrathberryCandidates(body);
+    assert.equal(headerX?.getAttribute(STRATHBERRY_CANDIDATE_ATTR), null, "Fixture 10: the header X must never be selected");
+    console.log("  ok: Fixture 10 (header X outside the modal never selected)");
+  }
+
+  // Fixture 11: no safe X target exists anywhere in the modal (only SHOP
+  // NOW and the country row — no icon at all). Expected: no candidate
+  // found, nothing marked, safe failure rather than an arbitrary pick.
+  {
+    const { body, shopNowButton, countryRow } = buildStrathberryModal({});
+    const result = resolveStrathberryCandidates(body);
+    assert.equal(result.found, false, "Fixture 11: no safe target should be found");
+    assert.equal(result.candidateCount, 0);
+    assert.equal(shopNowButton?.getAttribute(STRATHBERRY_CANDIDATE_ATTR), null);
+    assert.equal(countryRow?.getAttribute(STRATHBERRY_CANDIDATE_ATTR), null);
+    console.log("  ok: Fixture 11 (no safe target anywhere — safe failure, no arbitrary click)");
+  }
+
+  // Fixture 12 (gate unchanged): covered by the existing
+  // strathberryFallbackAppliesTo assertions below — that function was not
+  // touched by this change, so "Shopping To ..." and "Shipping To ..."
+  // continue to be accepted exactly as before.
+
+  // Fixtures 5-7: attemptBoundedCandidateDismissal — the bounded,
+  // injectable retry/verification algorithm, tested with fakes (no real
+  // Page/browser needed, mirroring region-wait.ts's established pattern).
+
+  // Fixture 5: the first safe candidate's click "succeeds" but never
+  // actually dismisses the modal; the second candidate does. Expected: the
+  // bounded retry tries candidate 2 and stops immediately on success.
+  {
+    let lastClickedIndex = -1;
+    const clickCalls: number[] = [];
+    const sleeps: number[] = [];
+    const logs: string[] = [];
+    const result = await attemptBoundedCandidateDismissal({
+      candidateCount: 2,
+      click: async (i) => {
+        clickCalls.push(i);
+        lastClickedIndex = i;
+        return { success: true };
+      },
+      dispatchSecondaryClick: async () => {},
+      isOverlayGone: async () => lastClickedIndex === 1,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      log: (m) => logs.push(m),
+    });
+    assert.equal(result, true, "Fixture 5: the bounded retry must succeed via the second candidate");
+    assert.deepEqual(clickCalls, [0, 1], "Fixture 5: must try candidate 0 then candidate 1, and stop");
+    assert.ok(logs.some((l) => l.includes("attempt 2") && l.includes("modalDisappeared=true")));
+    console.log("  ok: Fixture 5 (first candidate fails to dismiss, second succeeds, retry stops immediately)");
+  }
+
+  // Fixture 6: the click succeeds and the modal disappears, but only after
+  // a short asynchronous delay (e.g. a CSS transition). Expected:
+  // verification polls (bounded) and returns true once it's actually gone.
+  {
+    let checkCalls = 0;
+    const sleeps: number[] = [];
+    const result = await attemptBoundedCandidateDismissal({
+      candidateCount: 1,
+      click: async () => ({ success: true }),
+      dispatchSecondaryClick: async () => {},
+      isOverlayGone: async () => {
+        checkCalls++;
+        return checkCalls >= 3; // gone only from the 3rd check onward
+      },
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+    assert.equal(result, true, "Fixture 6: verification must wait for the delayed disappearance");
+    assert.ok(sleeps.length >= 2, "Fixture 6: expected the poll loop to actually wait before succeeding");
+    console.log("  ok: Fixture 6 (modal disappears asynchronously after a short delay — verification waits)");
+  }
+
+  // Fixture 7: the modal disappears immediately after the click, but has
+  // reappeared by the time of the short reappear-check. Expected: reported
+  // distinctly (modalReappeared=true, modalDisappeared=false) and NOT
+  // treated as a successful dismissal.
+  {
+    let checkCalls = 0;
+    const logs: string[] = [];
+    const result = await attemptBoundedCandidateDismissal({
+      candidateCount: 1,
+      click: async () => ({ success: true }),
+      dispatchSecondaryClick: async () => {},
+      isOverlayGone: async () => {
+        checkCalls++;
+        // 1st check (immediately after click): gone. 2nd check (the
+        // reappear check): back again.
+        return checkCalls === 1;
+      },
+      sleep: async () => {},
+      log: (m) => logs.push(m),
+    });
+    assert.equal(result, false, "Fixture 7: a reappearing modal must not count as a successful dismissal");
+    assert.ok(
+      logs.some((l) => l.includes("modalReappeared=true") && l.includes("modalDisappeared=false")),
+      "Fixture 7: reappearance must be logged distinctly from a clean success or a plain failure"
     );
+    console.log("  ok: Fixture 7 (modal disappears then reappears — reported distinctly, not treated as success)");
   }
 
   // 4. clearMarksFn: removes previously-set marker attributes.
@@ -505,4 +717,7 @@ function run() {
   console.log("All region.ts browser-evaluation regression tests passed.");
 }
 
-run();
+run().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});
