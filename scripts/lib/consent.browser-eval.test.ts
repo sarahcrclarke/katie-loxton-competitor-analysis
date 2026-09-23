@@ -12,6 +12,12 @@
  *      control (e.g. only "Cookies Settings" + a "Learn more" link).
  *   E. a bounded wait that gives an asynchronously-injected consent UI a
  *      chance to appear, tested via pollUntil() directly.
+ *   F. ordinary footer/legal links ("Terms of service", "Privacy policy",
+ *      "Cookies", "Modern slavery statement") with NO consent modal — a
+ *      live false positive we hit where this footer alone was wrongly
+ *      identified as the consent container.
+ *   G. the same footer links PLUS a real consent modal — the modal must
+ *      be selected over the footer, and only "Accept All Cookies" clicked.
  *
  * Like scripts/lib/region.browser-eval.test.ts, this stringifies the real
  * `new Function(...)`-built payloads exactly the way Playwright ships a
@@ -170,22 +176,41 @@ function reconstructInBrowserLikeSandbox<Arg, Result>(
   return script.runInContext(sandbox) as (arg: Arg) => Result;
 }
 
-const COOKIE_SIGNAL_SOURCES = [
-  "cookie policy",
-  "cookie preferences",
-  "cookie settings",
-  "manage cookies",
+const COOKIE_STRONG_SIGNAL_SOURCES = [
   "accept all cookies",
+  "accept all",
+  "allow all cookies",
+  "allow all",
   "reject all cookies",
+  "reject all",
+  "decline all",
+  "cookie settings",
+  "cookies settings",
+  "cookie preferences",
+  "manage cookies",
+  "manage preferences",
+  "manage cookie preferences",
+  "necessary cookies only",
+  "only necessary",
+  "continue without accepting",
   "storing of cookies",
   "cookies on your device",
   "tracking technologies",
-  "use of cookies",
   "we use cookies",
   "this (?:website|site) uses cookies",
-  "necessary cookies",
-  "non-essential cookies",
+  "use of cookies",
+];
+
+const COOKIE_WEAK_SIGNAL_SOURCES = [
+  "cookie policy",
+  "cookies policy",
   "privacy policy",
+  "privacy notice",
+  "terms of service",
+  "terms and conditions",
+  "modern slavery statement",
+  "cookies",
+  "privacy",
 ];
 
 const REJECT_TEXT_FRAGMENTS = [
@@ -284,6 +309,54 @@ function buildFixtureD() {
   return { body, overlayPanel, settingsButton, learnMoreLink };
 }
 
+function buildFooterLinks(): FakeElement[] {
+  // Mirrors the real live DOM shape from the false-positive report: each
+  // footer link is an <a> wrapping a <span> with the same label text, so
+  // both tags show up as separate clickable candidates.
+  const labels = ["Terms of service", "Privacy policy", "Cookies", "Modern slavery statement"];
+  return labels.map(
+    (label) =>
+      new FakeElement("a", {
+        children: [new FakeElement("span", { text: label })],
+      })
+  );
+}
+
+function buildFixtureF() {
+  // Live false positive: ordinary footer/legal links exist, but there is
+  // no consent modal anywhere on the page at all.
+  const footer = new FakeElement("footer", { children: buildFooterLinks() });
+  const body = new FakeElement("body", {
+    children: [new FakeElement("header", { text: "Strathberry" }), footer],
+  });
+  return { body, footer };
+}
+
+function buildFixtureG() {
+  // The same footer links, PLUS a real Strathberry-style consent modal
+  // elsewhere on the page. The modal (strong evidence) must be selected
+  // over the footer (weak evidence only).
+  const footer = new FakeElement("footer", { children: buildFooterLinks() });
+  const settingsButton = new FakeElement("button", { text: "Cookies Settings" });
+  const acceptButton = new FakeElement("button", { text: "Accept All Cookies" });
+  const overlayPanel = new FakeElement("div", {
+    children: [
+      new FakeElement("h2", { text: "Welcome to Strathberry" }),
+      new FakeElement("p", {
+        text:
+          'By clicking "Accept All Cookies", you agree to the storing of cookies on your device to enhance site navigation and analyse site usage.',
+      }),
+      new FakeElement("a", { text: "Cookie Policy" }),
+      settingsButton,
+      acceptButton,
+    ],
+  });
+  const body = new FakeElement("body", {
+    children: [new FakeElement("header", { text: "Strathberry" }), footer, overlayPanel],
+  });
+  return { body, footer, overlayPanel, settingsButton, acceptButton };
+}
+
 async function run() {
   console.log("Running consent.ts browser-evaluation regression tests...");
 
@@ -296,7 +369,11 @@ async function run() {
       __browserEvalPayloads.findOverlayCandidateFn,
       document
     );
-    const overlayResult = findOverlayCandidate({ patternSources: COOKIE_SIGNAL_SOURCES, attr: OVERLAY_ATTR });
+    const overlayResult = findOverlayCandidate({
+      strongPatternSources: COOKIE_STRONG_SIGNAL_SOURCES,
+      weakPatternSources: COOKIE_WEAK_SIGNAL_SOURCES,
+      attr: OVERLAY_ATTR,
+    });
     assert.ok(overlayResult, "Fixture A: expected the consent overlay to be positively detected");
     assert.equal(overlayPanel.getAttribute(OVERLAY_ATTR), "true");
 
@@ -338,7 +415,11 @@ async function run() {
       __browserEvalPayloads.findOverlayCandidateFn,
       document
     );
-    const overlayResult = findOverlayCandidate({ patternSources: COOKIE_SIGNAL_SOURCES, attr: OVERLAY_ATTR });
+    const overlayResult = findOverlayCandidate({
+      strongPatternSources: COOKIE_STRONG_SIGNAL_SOURCES,
+      weakPatternSources: COOKIE_WEAK_SIGNAL_SOURCES,
+      attr: OVERLAY_ATTR,
+    });
     assert.ok(overlayResult, "Fixture B: expected the consent overlay to be positively detected");
 
     const findControls = reconstructInBrowserLikeSandbox(__browserEvalPayloads.findControlsFn, document);
@@ -377,7 +458,11 @@ async function run() {
       __browserEvalPayloads.findOverlayCandidateFn,
       document
     );
-    const overlayResult = findOverlayCandidate({ patternSources: COOKIE_SIGNAL_SOURCES, attr: OVERLAY_ATTR });
+    const overlayResult = findOverlayCandidate({
+      strongPatternSources: COOKIE_STRONG_SIGNAL_SOURCES,
+      weakPatternSources: COOKIE_WEAK_SIGNAL_SOURCES,
+      attr: OVERLAY_ATTR,
+    });
     assert.equal(overlayResult, null, "Fixture C: no cookie/privacy overlay should be detected");
     assert.equal(
       acceptButton.getAttribute(OVERLAY_ATTR),
@@ -397,7 +482,11 @@ async function run() {
       __browserEvalPayloads.findOverlayCandidateFn,
       document
     );
-    const overlayResult = findOverlayCandidate({ patternSources: COOKIE_SIGNAL_SOURCES, attr: OVERLAY_ATTR });
+    const overlayResult = findOverlayCandidate({
+      strongPatternSources: COOKIE_STRONG_SIGNAL_SOURCES,
+      weakPatternSources: COOKIE_WEAK_SIGNAL_SOURCES,
+      attr: OVERLAY_ATTR,
+    });
     assert.ok(overlayResult, "Fixture D: cookie text should still be positively detected");
 
     const findControls = reconstructInBrowserLikeSandbox(__browserEvalPayloads.findControlsFn, document);
@@ -416,6 +505,97 @@ async function run() {
     assert.equal(learnMoreLink.getAttribute(ACCEPT_ATTR), null);
 
     console.log("  ok: Fixture D (detected, no safe control — no unsafe click, result is could-not-dismiss)");
+  }
+
+  // Fixture F: live false positive — ordinary footer/legal links only, no
+  // consent modal anywhere. The footer must never become the container.
+  {
+    const { body, footer } = buildFixtureF();
+    const document = makeFakeDocument(body);
+
+    const findOverlayCandidate = reconstructInBrowserLikeSandbox(
+      __browserEvalPayloads.findOverlayCandidateFn,
+      document
+    );
+    const overlayResult = findOverlayCandidate({
+      strongPatternSources: COOKIE_STRONG_SIGNAL_SOURCES,
+      weakPatternSources: COOKIE_WEAK_SIGNAL_SOURCES,
+      attr: OVERLAY_ATTR,
+    });
+    assert.equal(
+      overlayResult,
+      null,
+      "Fixture F: footer legal links alone (Terms of service, Privacy policy, Cookies, Modern slavery statement) must not be identified as a consent container"
+    );
+    for (const link of footer.allDescendantsPublic()) {
+      assert.equal(link.getAttribute(OVERLAY_ATTR), null, "Fixture F: no footer element may be marked/touched");
+    }
+
+    console.log("  ok: Fixture F (footer-only legal links never become the consent container — not-present)");
+  }
+
+  // Fixture G: the same footer links PLUS a real consent modal — the
+  // modal must be selected over the footer, and only Accept All Cookies
+  // clicked (Cookies Settings and the footer's own "Cookies" link must
+  // never be chosen).
+  {
+    const { body, footer, overlayPanel, settingsButton, acceptButton } = buildFixtureG();
+    const document = makeFakeDocument(body);
+
+    const findOverlayCandidate = reconstructInBrowserLikeSandbox(
+      __browserEvalPayloads.findOverlayCandidateFn,
+      document
+    );
+    const overlayResult = findOverlayCandidate({
+      strongPatternSources: COOKIE_STRONG_SIGNAL_SOURCES,
+      weakPatternSources: COOKIE_WEAK_SIGNAL_SOURCES,
+      attr: OVERLAY_ATTR,
+    });
+    assert.ok(overlayResult, "Fixture G: the real consent modal must be positively detected");
+    assert.equal(
+      overlayPanel.getAttribute(OVERLAY_ATTR),
+      "true",
+      "Fixture G: the modal, not the footer, must be selected as the consent container"
+    );
+    for (const link of footer.allDescendantsPublic()) {
+      assert.equal(
+        link.getAttribute(OVERLAY_ATTR),
+        null,
+        "Fixture G: the footer must never be selected as the consent container"
+      );
+    }
+
+    const findControls = reconstructInBrowserLikeSandbox(__browserEvalPayloads.findControlsFn, document);
+    const controlsResult = findControls({
+      overlayAttr: OVERLAY_ATTR,
+      rejectAttr: REJECT_ATTR,
+      acceptAttr: ACCEPT_ATTR,
+      rejectFragments: REJECT_TEXT_FRAGMENTS,
+      acceptFragments: ACCEPT_TEXT_FRAGMENTS,
+    });
+    assert.equal(controlsResult.rejectFound, false, "Fixture G: there is no reject control in this variant");
+    assert.equal(controlsResult.acceptFound, true, "Fixture G: Accept All Cookies must be found");
+    assert.equal(acceptButton.getAttribute(ACCEPT_ATTR), "true");
+    assert.equal(
+      settingsButton.getAttribute(ACCEPT_ATTR),
+      null,
+      "Fixture G: Cookies Settings must never be selected"
+    );
+    for (const link of footer.allDescendantsPublic()) {
+      assert.equal(link.getAttribute(ACCEPT_ATTR), null, "Fixture G: no footer link may be clicked");
+      assert.equal(link.getAttribute(REJECT_ATTR), null, "Fixture G: no footer link may be clicked");
+    }
+
+    overlayPanel.hide();
+    const isMarkedElementVisible = reconstructInBrowserLikeSandbox(
+      __browserEvalPayloads.isMarkedElementVisibleFn,
+      document
+    );
+    assert.equal(isMarkedElementVisible(OVERLAY_ATTR), false, "Fixture G: dismissal must be verified as gone");
+
+    console.log(
+      "  ok: Fixture G (modal selected over footer, only Accept All Cookies clicked, dismissal verified)"
+    );
   }
 
   // Fixture E: bounded wait for an asynchronously-injected consent UI.
