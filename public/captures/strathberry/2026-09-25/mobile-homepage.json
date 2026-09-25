@@ -1,0 +1,21 @@
+{
+  "competitor": "strathberry",
+  "url": "https://www.strathberry.com/",
+  "timestamp": "2026-09-25T12:33:10.476Z",
+  "viewport": {
+    "width": 390,
+    "height": 844,
+    "deviceScaleFactor": 1,
+    "isMobile": true,
+    "label": "390x844 mobile (iPhone-class CSS viewport, 1x)"
+  },
+  "screenshotPaths": [
+    "public/captures/strathberry/2026-09-25/mobile-homepage.webp"
+  ],
+  "consentStatus": "rejected",
+  "regionStatus": "could-not-confirm",
+  "detectedStore": "United Kingdom",
+  "detectedCurrency": "GBP",
+  "success": true,
+  "error": null
+}
