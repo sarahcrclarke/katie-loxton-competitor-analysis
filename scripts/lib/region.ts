@@ -17,6 +17,11 @@ const CLOSE_MARK_ATTR = "data-kl-region-close";
 // marks the ranked, ordered set of safe click-target candidates resolved
 // for the Strathberry-specific bounded retry below.
 const STRATHBERRY_CANDIDATE_MARK_ATTR = "data-kl-region-close-candidate";
+// Marks the TRUE enclosing Headless UI dialog panel once resolved (see
+// resolveStrathberryDialogPanelFn below) — distinct from OVERLAY_MARK_ATTR,
+// which live evidence showed can land on a small nested control (e.g. the
+// country-selector button) rather than the actual modal panel.
+const STRATHBERRY_PANEL_MARK_ATTR = "data-kl-region-strathberry-panel";
 
 // Text signals strong enough to mean "this element is a country/region/
 // currency/store-switch prompt". Regex *sources* (strings, no literal
@@ -231,6 +236,109 @@ const findStructuralCloseControlFn = new Function(
   `
 ) as unknown as BrowserFn<StructuralCloseArgs, boolean>;
 
+type StrathberryPanelArgs = { seedAttr: string; panelMarkAttr: string };
+type StrathberryPanelResult = {
+  seedRect: { top: number; left: number; right: number; bottom: number; width: number; height: number } | null;
+  panelFound: boolean;
+  panelRect: { top: number; left: number; right: number; bottom: number; width: number; height: number } | null;
+  panelTextSample: string;
+  resolutionStrategy: "headlessui-dialog-panel-id" | "text-and-size-heuristic" | "none";
+};
+
+// Live evidence showed the generic findOverlayCandidateFn above can lock
+// onto a small nested control (Strathberry's 294x41 "United States"
+// country-selector button, whose own text happens to match a region
+// signal pattern) instead of the true modal panel. This Strathberry-
+// specific step runs AFTER that seed is found and resolves the actual
+// enclosing Headless UI dialog panel, searched upward from the seed:
+//
+//   1. Primary: the nearest ancestor whose `id` starts with
+//      "headlessui-dialog-panel-" — a prefix match, since the generated
+//      suffix varies between runs and must never be hardcoded.
+//   2. Fallback: the nearest ancestor whose own text contains both a
+//      shipping/shopping-to phrase and the UK-store confirmation wording,
+//      and whose rect is modal-sized (>=150x150) — for markup that lacks
+//      the Headless UI id entirely.
+//
+// Marks the resolved panel (not the seed) so all subsequent close-control
+// discovery below operates against the true panel boundary.
+const resolveStrathberryDialogPanelFn = new Function(
+  "args",
+  `
+  var seedAttr = args.seedAttr;
+  var panelMarkAttr = args.panelMarkAttr;
+  var seed = document.querySelector('[' + seedAttr + '="true"]');
+  if (!seed) {
+    return { seedRect: null, panelFound: false, panelRect: null, panelTextSample: '', resolutionStrategy: 'none' };
+  }
+
+  function vpRect(r) {
+    return { top: r.top, left: r.left, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
+  }
+
+  var seedRect = seed.getBoundingClientRect();
+
+  function hasHeadlessUiPanelId(el) {
+    var id = el.getAttribute ? el.getAttribute('id') : null;
+    return !!id && id.indexOf('headlessui-dialog-panel-') === 0;
+  }
+
+  function looksLikeShippingPanel(el) {
+    var text = (el.innerText || '').toLowerCase();
+    var hasShipWording = text.indexOf('shipping to') !== -1 || text.indexOf('shopping to') !== -1;
+    var hasUkConfirmation = text.indexOf('united kingdom store') !== -1;
+    if (!hasShipWording || !hasUkConfirmation) return false;
+    var rect = el.getBoundingClientRect();
+    return rect.width >= 150 && rect.height >= 150;
+  }
+
+  var panel = null;
+  var strategy = 'none';
+
+  var idNode = seed;
+  var idDepth = 0;
+  while (idNode && idDepth < 12) {
+    if (hasHeadlessUiPanelId(idNode)) {
+      panel = idNode;
+      strategy = 'headlessui-dialog-panel-id';
+      break;
+    }
+    idNode = idNode.parentElement;
+    idDepth++;
+  }
+
+  if (!panel) {
+    var textNode = seed.parentElement;
+    var textDepth = 0;
+    while (textNode && textDepth < 12) {
+      if (looksLikeShippingPanel(textNode)) {
+        panel = textNode;
+        strategy = 'text-and-size-heuristic';
+        break;
+      }
+      textNode = textNode.parentElement;
+      textDepth++;
+    }
+  }
+
+  if (!panel) {
+    return { seedRect: vpRect(seedRect), panelFound: false, panelRect: null, panelTextSample: '', resolutionStrategy: 'none' };
+  }
+
+  panel.setAttribute(panelMarkAttr, 'true');
+  var panelRect = panel.getBoundingClientRect();
+  var sample = (panel.innerText || '').slice(0, 200);
+
+  return {
+    seedRect: vpRect(seedRect),
+    panelFound: true,
+    panelRect: vpRect(panelRect),
+    panelTextSample: sample,
+    resolutionStrategy: strategy
+  };
+  `
+) as unknown as BrowserFn<StrathberryPanelArgs, StrathberryPanelResult>;
+
 // Text that must never be picked as a close control, even if it happens to
 // be small and top-right positioned — belt-and-braces on top of the
 // structural exclusions in findStrathberryCloseCandidatesFn below.
@@ -261,6 +369,16 @@ export type StrathberryCandidateDiagnostic = {
   text: string;
   hasSvgOrPath: boolean;
   relationship: string;
+  // Whether this candidate is, or is inside, the original (wrong)
+  // findOverlayCandidateFn seed element — Strathberry's country-selector
+  // button in the confirmed live evidence. Reported for every candidate,
+  // not just rejected ones, so the diagnostics log makes the exclusion
+  // visible either way.
+  insideCountrySelector: boolean;
+  // Whether this candidate's own class, or a descendant svg's class,
+  // contains "chevron" (e.g. Font Awesome's fa-chevron-down) — the known
+  // bad icon confirmed live inside the country selector.
+  hasChevronClass: boolean;
   rank: number;
   accepted: boolean;
   rejectReason: string | null;
@@ -274,6 +392,11 @@ type StrathberryResolveArgs = {
   overlayAttr: string;
   markAttr: string;
   excludeFragments: string[];
+  // Attribute marking the original (possibly wrong) seed element — e.g.
+  // OVERLAY_MARK_ATTR or STRATHBERRY_PANEL_MARK_ATTR's excluded sibling —
+  // whose subtree must never be treated as, or contain, the close control.
+  // Optional: when omitted/empty, no ancestor-based exclusion is applied.
+  excludeAncestorAttr?: string;
 };
 type StrathberryResolveResult = {
   visualX: StrathberryVisualX;
@@ -309,8 +432,43 @@ const findStrathberryCloseCandidatesFn = new Function(
   var overlayAttr = args.overlayAttr;
   var markAttr = args.markAttr;
   var excludeFragments = args.excludeFragments;
+  var excludeAncestorAttr = args.excludeAncestorAttr;
   var container = document.querySelector('[' + overlayAttr + '="true"]');
   if (!container) return { visualX: null, candidates: [], candidateCount: 0, found: false };
+
+  var excludedSeed = excludeAncestorAttr ? document.querySelector('[' + excludeAncestorAttr + '="true"]') : null;
+
+  function isInsideExcludedSeed(el) {
+    if (!excludedSeed) return false;
+    if (el === excludedSeed) return true;
+    return typeof excludedSeed.contains === 'function' && excludedSeed.contains(el);
+  }
+
+  function ownClassHasChevron(el) {
+    var ownClass = el.getAttribute ? (el.getAttribute('class') || '') : '';
+    return ownClass.toLowerCase().indexOf('chevron') !== -1;
+  }
+
+  function hasChevronClass(el) {
+    if (ownClassHasChevron(el)) return true;
+    if (el.querySelectorAll) {
+      var svgs = el.querySelectorAll('svg, path');
+      for (var s = 0; s < svgs.length; s++) {
+        if (ownClassHasChevron(svgs[s])) return true;
+      }
+    }
+    // A <path> (or other node) nested inside a chevron-classed <svg> is
+    // part of that same icon, even though the class lives on an ancestor,
+    // not on the node itself or one of its own descendants.
+    var ancestor = el.parentElement;
+    var ancestorDepth = 0;
+    while (ancestor && ancestor !== container && ancestorDepth < 10) {
+      if (ownClassHasChevron(ancestor)) return true;
+      ancestor = ancestor.parentElement;
+      ancestorDepth++;
+    }
+    return false;
+  }
 
   var containerRect = container.getBoundingClientRect();
   var marginX = Math.max(24, containerRect.width * 0.25);
@@ -364,6 +522,8 @@ const findStrathberryCloseCandidatesFn = new Function(
     var hasSvgOrPath = tag === 'svg' || tag === 'path' || el.querySelectorAll('svg, path').length > 0;
     var excludedHere = accessibleText.length > 3 || containsExcludedText(accessibleText) || containsExcludedText(text);
     if (excludedHere) continue;
+    if (isInsideExcludedSeed(el)) continue;
+    if (hasChevronClass(el)) continue;
     topRightSmall.push({ el: el, tag: tag, rect: rect, hasSvgOrPath: hasSvgOrPath, area: rect.width * rect.height });
   }
   var withSvg = topRightSmall.filter(function (c) { return c.hasSvgOrPath; });
@@ -416,10 +576,16 @@ const findStrathberryCloseCandidatesFn = new Function(
     var cText = (cEl.innerText || '').trim();
     var cAccessibleText = (cAriaLabel || cTitle || cText || '').trim();
     var cHasSvgOrPath = cTag === 'svg' || cTag === 'path' || cEl.querySelectorAll('svg, path').length > 0;
+    var cInsideCountrySelector = isInsideExcludedSeed(cEl);
+    var cHasChevronClass = hasChevronClass(cEl);
 
     var rejectReason = null;
     if (cRect.width === 0 || cRect.height === 0) {
       rejectReason = 'not visible / zero-size';
+    } else if (cInsideCountrySelector) {
+      rejectReason = 'inside country selector control';
+    } else if (cHasChevronClass) {
+      rejectReason = 'fa-chevron-down icon (country selector chevron)';
     } else if (cRect.width > 80 || cRect.height > 80) {
       rejectReason = 'too large to be the X control';
     } else if (cAccessibleText.length > 3 && !cHasSvgOrPath) {
@@ -445,6 +611,8 @@ const findStrathberryCloseCandidatesFn = new Function(
       text: cText,
       hasSvgOrPath: cHasSvgOrPath,
       relationship: entry.depth === 0 ? 'self' : ('ancestor depth ' + entry.depth),
+      insideCountrySelector: cInsideCountrySelector,
+      hasChevronClass: cHasChevronClass,
       rank: rankOf(cEl),
       accepted: !rejectReason,
       rejectReason: rejectReason,
@@ -478,6 +646,8 @@ const findStrathberryCloseCandidatesFn = new Function(
       text: dc.text,
       hasSvgOrPath: dc.hasSvgOrPath,
       relationship: dc.relationship,
+      insideCountrySelector: dc.insideCountrySelector,
+      hasChevronClass: dc.hasChevronClass,
       rank: dc.rank,
       accepted: dc.accepted,
       rejectReason: dc.rejectReason,
@@ -538,6 +708,7 @@ export const __browserEvalPayloads = {
   isRegionSignalVisibleFn,
   findOverlayCandidateFn,
   findStructuralCloseControlFn,
+  resolveStrathberryDialogPanelFn,
   findStrathberryCloseCandidatesFn,
   isMarkedOverlayVisibleFn,
   dispatchClickOnMarkedFn,
@@ -628,9 +799,9 @@ function logStrathberryResolutionDiagnostics(resolution: StrathberryResolveResul
       `Strathberry visual X: tag=${resolution.visualX.tag} rect=${JSON.stringify(resolution.visualX.rect)}`
     );
   } else {
-    console.log("Strathberry visual X: none found within overlay");
+    console.log("Strathberry visual X: none found within TRUE panel");
   }
-  console.log(`Strathberry close candidates inspected: ${resolution.candidates.length}`);
+  console.log(`Strathberry close candidates inside TRUE panel: ${resolution.candidates.length}`);
   for (const c of resolution.candidates) {
     console.log(
       `Strathberry close candidate: tag=${c.tag} relationship=${c.relationship} rank=${c.rank} ` +
@@ -639,20 +810,22 @@ function logStrathberryResolutionDiagnostics(resolution: StrathberryResolveResul
         )} title=${JSON.stringify(c.title)} tabindex=${c.hasTabIndex} cursor=${c.cursor} ` +
         `pointerEvents=${c.pointerEvents} onclick=${c.hasOnClick} text=${JSON.stringify(
           c.text
-        )} hasSvgOrPath=${c.hasSvgOrPath} accepted=${c.accepted}` +
+        )} hasSvgOrPath=${c.hasSvgOrPath} insideCountrySelector=${c.insideCountrySelector} ` +
+        `hasChevronClass=${c.hasChevronClass} accepted=${c.accepted}` +
         `${c.rejectReason ? ` rejectReason=${JSON.stringify(c.rejectReason)}` : ""} order=${c.order}`
     );
   }
 }
 
-// Precise "is the confirmed overlay actually gone" check used only by the
-// bounded Strathberry retry below: checks the specific marked overlay
-// element first (hidden or detached), falling back to the existing,
-// unmodified isRegionSignalVisible() as a second signal — never relying on
-// only one text node disappearing.
-async function isStrathberryOverlayGone(page: Page): Promise<boolean> {
-  const overlayElementStillVisible = await page.evaluate(isMarkedOverlayVisibleFn, OVERLAY_MARK_ATTR);
-  if (overlayElementStillVisible) return false;
+// Precise "is the given marked element actually gone" check used only by
+// the bounded Strathberry retry below: checks the specific marked element
+// first (hidden or detached), falling back to the existing, unmodified
+// isRegionSignalVisible() as a second signal — never relying on only one
+// text node disappearing. Parameterized by attr so it can verify either
+// the original overlay seed or (now) the TRUE resolved dialog panel.
+async function isStrathberryPanelGone(page: Page, markAttr: string): Promise<boolean> {
+  const elementStillVisible = await page.evaluate(isMarkedOverlayVisibleFn, markAttr);
+  if (elementStillVisible) return false;
   return !(await isRegionSignalVisible(page));
 }
 
@@ -740,14 +913,39 @@ export async function attemptBoundedCandidateDismissal(
  * clicks SHOP NOW. Thin real-Page wrapper around
  * findStrathberryCloseCandidatesFn (discovery + resolution) and
  * attemptBoundedCandidateDismissal (bounded retry + verification).
+ *
+ * Live evidence showed the confirmed region-overlay seed (OVERLAY_MARK_ATTR)
+ * can itself be a small nested control (Strathberry's country-selector
+ * button) rather than the true modal panel, so this first resolves the
+ * actual enclosing Headless UI dialog panel via
+ * resolveStrathberryDialogPanelFn and only then searches within it —
+ * explicitly excluding the original seed's subtree and any
+ * fa-chevron-down icon from close-control consideration.
  */
 async function attemptStrathberryDismissal(page: Page): Promise<boolean> {
+  await page.evaluate(clearMarksFn, STRATHBERRY_PANEL_MARK_ATTR);
+
+  const panelResolution = await page.evaluate(resolveStrathberryDialogPanelFn, {
+    seedAttr: OVERLAY_MARK_ATTR,
+    panelMarkAttr: STRATHBERRY_PANEL_MARK_ATTR,
+  });
+  console.log(`Strathberry region seed rect: ${JSON.stringify(panelResolution.seedRect)}`);
+  console.log(`Strathberry resolved dialog panel: ${panelResolution.panelFound}`);
+  console.log(`Strathberry dialog panel rect: ${JSON.stringify(panelResolution.panelRect)}`);
+  console.log(`Strathberry dialog panel text signals: ${JSON.stringify(panelResolution.panelTextSample)}`);
+  console.log(`Strathberry dialog panel resolution strategy: ${panelResolution.resolutionStrategy}`);
+
+  if (!panelResolution.panelFound) {
+    return false;
+  }
+
   await page.evaluate(clearMarksFn, STRATHBERRY_CANDIDATE_MARK_ATTR);
 
   const resolution = await page.evaluate(findStrathberryCloseCandidatesFn, {
-    overlayAttr: OVERLAY_MARK_ATTR,
+    overlayAttr: STRATHBERRY_PANEL_MARK_ATTR,
     markAttr: STRATHBERRY_CANDIDATE_MARK_ATTR,
     excludeFragments: STRATHBERRY_FALLBACK_EXCLUDE_FRAGMENTS,
+    excludeAncestorAttr: OVERLAY_MARK_ATTR,
   });
   logStrathberryResolutionDiagnostics(resolution);
 
@@ -758,6 +956,15 @@ async function attemptStrathberryDismissal(page: Page): Promise<boolean> {
   const acceptedByOrder = resolution.candidates
     .filter((c) => c.accepted && c.order >= 0)
     .sort((a, b) => a.order - b.order);
+
+  const selected = acceptedByOrder[0];
+  console.log(
+    selected
+      ? `Strathberry selected close target: tag=${selected.tag} relationship=${selected.relationship} ` +
+          `rect=${JSON.stringify(selected.rect)} insideCountrySelector=${selected.insideCountrySelector} ` +
+          `hasChevronClass=${selected.hasChevronClass}`
+      : "Strathberry selected close target: none"
+  );
 
   return attemptBoundedCandidateDismissal({
     candidateCount: resolution.candidateCount,
@@ -790,376 +997,10 @@ async function attemptStrathberryDismissal(page: Page): Promise<boolean> {
         // candidate (or gives up) based on the verification check below.
       }
     },
-    isOverlayGone: () => isStrathberryOverlayGone(page),
+    isOverlayGone: () => isStrathberryPanelGone(page, STRATHBERRY_PANEL_MARK_ATTR),
     sleep: (ms) => page.waitForTimeout(ms),
     log: (message) => console.log(message),
   });
-}
-
-// ---------------------------------------------------------------------
-// TEMPORARY, READ-ONLY DIAGNOSTICS.
-//
-// Live evidence showed the resolved click target (an SVG/path inside a
-// button whose own text is "United States") accepting Playwright clicks
-// without ever dismissing the modal. Before changing ranking/selection
-// logic again, this collects a bounded, read-only inventory of the
-// confirmed overlay's plausible close-X candidates and inspects what
-// document.elementsFromPoint() actually reports at the overlay's visible
-// top-right corner — never clicking anything. Intended to be removed once
-// the real DOM structure is confirmed from a live run.
-// ---------------------------------------------------------------------
-
-export type StrathberryDiagnosticElement = {
-  index: number;
-  tag: string;
-  parentTag: string | null;
-  parentText: string;
-  ownText: string;
-  fullText: string;
-  className: string | null;
-  id: string | null;
-  role: string | null;
-  ariaLabel: string | null;
-  title: string | null;
-  hasTabIndex: boolean;
-  hasOnClick: boolean;
-  cursor: string;
-  pointerEvents: string;
-  rectViewport: { top: number; left: number; right: number; bottom: number; width: number; height: number };
-  rectRelative: { top: number; left: number; right: number; bottom: number; width: number; height: number };
-  svgPathRelationship: "is-svg" | "is-path" | "contains-svg-or-path" | "none";
-  isTopRightZone: boolean;
-};
-
-export type StrathberryAssumedXDetail = {
-  tag: string;
-  rectViewport: { top: number; left: number; right: number; bottom: number; width: number; height: number };
-  rectRelative: { top: number; left: number; right: number; bottom: number; width: number; height: number };
-  viewBox: string | null;
-  outerHtmlTrunc: string;
-  parentChain: { tag: string; text: string; rectRelative: { top: number; left: number; right: number; bottom: number; width: number; height: number } }[];
-  siblings: { tag: string; text: string; rectRelative: { top: number; left: number; right: number; bottom: number; width: number; height: number } }[];
-} | null;
-
-export type StrathberryProbeStackEntry = {
-  tag: string;
-  className: string | null;
-  id: string | null;
-  role: string | null;
-  ariaLabel: string | null;
-  title: string | null;
-  text: string;
-  rectViewport: { top: number; left: number; right: number; bottom: number; width: number; height: number };
-  insideOverlay: boolean;
-  ancestorChainTags: string[];
-};
-
-export type StrathberryProbePoint = {
-  label: string;
-  x: number;
-  y: number;
-  stack: StrathberryProbeStackEntry[];
-};
-
-type StrathberryDiagnosticsArgs = { overlayAttr: string };
-type StrathberryDiagnosticsResult = {
-  overlayRect: { top: number; left: number; right: number; bottom: number; width: number; height: number } | null;
-  inventory: StrathberryDiagnosticElement[];
-  currentlyAssumedX: StrathberryAssumedXDetail;
-  probePoints: StrathberryProbePoint[];
-};
-
-// Single self-contained evaluate payload (kept as one `new Function(...)`
-// call, same as every other browser-executed payload in this file, for
-// the same __name-safety reason) so the whole inventory + probe can be
-// collected in one round trip. Purely read-only: it never calls .click(),
-// never dispatches events, and never sets any DOM attribute.
-const collectStrathberryDomDiagnosticsFn = new Function(
-  "args",
-  `
-  var overlayAttr = args.overlayAttr;
-  var container = document.querySelector('[' + overlayAttr + '="true"]');
-  if (!container) {
-    return { overlayRect: null, inventory: [], currentlyAssumedX: null, probePoints: [] };
-  }
-
-  var containerRect = container.getBoundingClientRect();
-  var relRect = function (rect) {
-    return {
-      top: rect.top - containerRect.top,
-      left: rect.left - containerRect.left,
-      right: rect.right - containerRect.left,
-      bottom: rect.bottom - containerRect.top,
-      width: rect.width,
-      height: rect.height
-    };
-  };
-  var viewportRect = function (rect) {
-    return { top: rect.top, left: rect.left, right: rect.right, bottom: rect.bottom, width: rect.width, height: rect.height };
-  };
-  var truncate = function (s, n) {
-    s = s || '';
-    return s.length > n ? s.slice(0, n) + '…' : s;
-  };
-  var isVisible = function (el) {
-    var rect = el.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return false;
-    var style = window.getComputedStyle(el);
-    if (style.visibility === 'hidden' || style.display === 'none') return false;
-    if (parseFloat(style.opacity) === 0) return false;
-    return true;
-  };
-  var marginX = Math.max(24, containerRect.width * 0.25);
-  var marginY = Math.max(24, containerRect.height * 0.25);
-  var isTopRightZone = function (rect) {
-    return rect.right >= containerRect.right - marginX && rect.top <= containerRect.top + marginY;
-  };
-  var svgPathRelationship = function (el, tag) {
-    if (tag === 'svg') return 'is-svg';
-    if (tag === 'path') return 'is-path';
-    if (el.querySelectorAll('svg, path').length > 0) return 'contains-svg-or-path';
-    return 'none';
-  };
-
-  // --- 1. Bounded inventory of plausible close-X candidates. ---
-  var all = container.querySelectorAll('*');
-  var inventory = [];
-  for (var i = 0; i < all.length && inventory.length < 30; i++) {
-    var el = all[i];
-    if (!isVisible(el)) continue;
-    var tag = el.tagName ? el.tagName.toLowerCase() : '';
-    var role = el.getAttribute('role');
-    var ariaLabel = el.getAttribute('aria-label');
-    var titleAttr = el.getAttribute('title');
-    var hasTabIndex = el.hasAttribute('tabindex');
-    var hasOnClick = el.hasAttribute('onclick');
-    var style = window.getComputedStyle(el);
-    var cursor = style.cursor;
-    var rect = el.getBoundingClientRect();
-    var relationship = svgPathRelationship(el, tag);
-
-    var plausible =
-      tag === 'button' ||
-      role === 'button' ||
-      tag === 'svg' ||
-      tag === 'path' ||
-      !!ariaLabel ||
-      !!titleAttr ||
-      hasOnClick ||
-      hasTabIndex ||
-      cursor === 'pointer' ||
-      (rect.width <= 60 && rect.height <= 60 && isTopRightZone(rect));
-    if (!plausible) continue;
-
-    var parent = el.parentElement;
-    inventory.push({
-      index: inventory.length,
-      tag: tag,
-      parentTag: parent ? parent.tagName.toLowerCase() : null,
-      parentText: truncate(parent ? (parent.innerText || '') : '', 80),
-      ownText: truncate(el.textContent || '', 80),
-      fullText: truncate(el.innerText || '', 120),
-      className: el.getAttribute('class'),
-      id: el.getAttribute('id'),
-      role: role,
-      ariaLabel: ariaLabel,
-      title: titleAttr,
-      hasTabIndex: hasTabIndex,
-      hasOnClick: hasOnClick,
-      cursor: cursor,
-      pointerEvents: style.pointerEvents,
-      rectViewport: viewportRect(rect),
-      rectRelative: relRect(rect),
-      svgPathRelationship: relationship,
-      isTopRightZone: isTopRightZone(rect)
-    });
-  }
-
-  // --- 2. CURRENTLY_ASSUMED_X — same read-only discovery heuristic used
-  // for the visual X in findStrathberryCloseCandidatesFn, duplicated here
-  // (rather than sharing state) so this diagnostic pass has zero side
-  // effects on the production discovery/resolution function.
-  var topRightSmall = [];
-  for (var j = 0; j < all.length; j++) {
-    var el2 = all[j];
-    if (!isVisible(el2)) continue;
-    var rect2 = el2.getBoundingClientRect();
-    if (rect2.width > 60 || rect2.height > 60) continue;
-    if (!isTopRightZone(rect2)) continue;
-    var tag2 = el2.tagName ? el2.tagName.toLowerCase() : '';
-    var hasSvgOrPath2 = tag2 === 'svg' || tag2 === 'path' || el2.querySelectorAll('svg, path').length > 0;
-    topRightSmall.push({ el: el2, tag: tag2, rect: rect2, hasSvgOrPath: hasSvgOrPath2, area: rect2.width * rect2.height });
-  }
-  var withSvg2 = topRightSmall.filter(function (c) { return c.hasSvgOrPath; });
-  var pool2 = withSvg2.length > 0 ? withSvg2 : topRightSmall;
-  pool2.sort(function (a, b) { return a.area - b.area; });
-  var assumedX = pool2.length > 0 ? pool2[0] : null;
-
-  var currentlyAssumedX = null;
-  if (assumedX) {
-    var parentChain = [];
-    var node = assumedX.el.parentElement;
-    var depth = 0;
-    while (node && node !== container && depth < 5) {
-      parentChain.push({ tag: node.tagName.toLowerCase(), text: truncate(node.innerText || '', 80), rectRelative: relRect(node.getBoundingClientRect()) });
-      node = node.parentElement;
-      depth++;
-    }
-    var siblings = [];
-    if (assumedX.el.parentElement) {
-      var sibs = assumedX.el.parentElement.children;
-      for (var s = 0; s < sibs.length; s++) {
-        if (sibs[s] === assumedX.el) continue;
-        siblings.push({ tag: sibs[s].tagName.toLowerCase(), text: truncate(sibs[s].innerText || '', 80), rectRelative: relRect(sibs[s].getBoundingClientRect()) });
-      }
-    }
-    var viewBoxAttr = assumedX.tag === 'svg' ? assumedX.el.getAttribute('viewBox') : (assumedX.el.closest ? (function () { var s = assumedX.el.closest('svg'); return s ? s.getAttribute('viewBox') : null; })() : null);
-    currentlyAssumedX = {
-      tag: assumedX.tag,
-      rectViewport: viewportRect(assumedX.rect),
-      rectRelative: relRect(assumedX.rect),
-      viewBox: viewBoxAttr,
-      outerHtmlTrunc: truncate(assumedX.el.outerHTML || '', 300),
-      parentChain: parentChain,
-      siblings: siblings
-    };
-  }
-
-  // --- 3. Read-only elementsFromPoint probes near the overlay's visible
-  // top-right corner. INSPECTION ONLY — nothing is clicked or dispatched.
-  var probeSpecs = [
-    { label: '8px-inside-top-right', x: containerRect.right - 8, y: containerRect.top + 8 },
-    { label: '12px-inside-top-right', x: containerRect.right - 12, y: containerRect.top + 12 },
-    { label: '16px-inside-top-right', x: containerRect.right - 16, y: containerRect.top + 16 }
-  ];
-  if (assumedX) {
-    probeSpecs.push({
-      label: 'currently-assumed-x-center',
-      x: (assumedX.rect.left + assumedX.rect.right) / 2,
-      y: (assumedX.rect.top + assumedX.rect.bottom) / 2
-    });
-  }
-
-  var probePoints = [];
-  for (var p = 0; p < probeSpecs.length; p++) {
-    var spec = probeSpecs[p];
-    var stackEls = typeof document.elementsFromPoint === 'function' ? document.elementsFromPoint(spec.x, spec.y) : [];
-    var stack = [];
-    for (var k = 0; k < stackEls.length && k < 8; k++) {
-      var stackEl = stackEls[k];
-      var ancestorTags = [];
-      var walker = stackEl.parentElement;
-      var wDepth = 0;
-      while (walker && walker !== container && wDepth < 5) {
-        ancestorTags.push(walker.tagName.toLowerCase());
-        walker = walker.parentElement;
-        wDepth++;
-      }
-      stack.push({
-        tag: stackEl.tagName ? stackEl.tagName.toLowerCase() : '',
-        className: stackEl.getAttribute ? stackEl.getAttribute('class') : null,
-        id: stackEl.getAttribute ? stackEl.getAttribute('id') : null,
-        role: stackEl.getAttribute ? stackEl.getAttribute('role') : null,
-        ariaLabel: stackEl.getAttribute ? stackEl.getAttribute('aria-label') : null,
-        title: stackEl.getAttribute ? stackEl.getAttribute('title') : null,
-        text: truncate(stackEl.innerText || (stackEl.textContent || ''), 80),
-        rectViewport: viewportRect(stackEl.getBoundingClientRect()),
-        insideOverlay: typeof container.contains === 'function' ? container.contains(stackEl) : false,
-        ancestorChainTags: ancestorTags
-      });
-    }
-    probePoints.push({ label: spec.label, x: spec.x, y: spec.y, stack: stack });
-  }
-
-  return {
-    overlayRect: viewportRect(containerRect),
-    inventory: inventory,
-    currentlyAssumedX: currentlyAssumedX,
-    probePoints: probePoints
-  };
-  `
-) as unknown as BrowserFn<StrathberryDiagnosticsArgs, StrathberryDiagnosticsResult>;
-
-function logStrathberryDomDiagnostics(result: StrathberryDiagnosticsResult): void {
-  console.log("STRATHBERRY DIAGNOSTICS: BEGIN");
-  console.log(`STRATHBERRY DIAGNOSTICS: confirmed overlay rect=${JSON.stringify(result.overlayRect)}`);
-
-  console.log(`STRATHBERRY DIAGNOSTICS: candidate inventory: ${result.inventory.length} elements`);
-  for (const e of result.inventory) {
-    console.log(
-      `STRATHBERRY DIAGNOSTICS: element ${e.index}: tag=${e.tag} parentTag=${e.parentTag} ` +
-        `parentText=${JSON.stringify(e.parentText)} ownText=${JSON.stringify(e.ownText)} ` +
-        `fullText=${JSON.stringify(e.fullText)} class=${JSON.stringify(e.className)} id=${JSON.stringify(
-          e.id
-        )} role=${JSON.stringify(e.role)} ariaLabel=${JSON.stringify(e.ariaLabel)} title=${JSON.stringify(
-          e.title
-        )} tabindex=${e.hasTabIndex} onclick=${e.hasOnClick} cursor=${e.cursor} pointerEvents=${e.pointerEvents} ` +
-        `rectViewport=${JSON.stringify(e.rectViewport)} rectRelative=${JSON.stringify(
-          e.rectRelative
-        )} svgPathRelationship=${e.svgPathRelationship} isTopRightZone=${e.isTopRightZone}`
-    );
-  }
-
-  if (result.currentlyAssumedX) {
-    const x = result.currentlyAssumedX;
-    console.log(
-      `STRATHBERRY DIAGNOSTICS: CURRENTLY_ASSUMED_X: tag=${x.tag} rectViewport=${JSON.stringify(
-        x.rectViewport
-      )} rectRelative=${JSON.stringify(x.rectRelative)} viewBox=${JSON.stringify(x.viewBox)}`
-    );
-    console.log(`STRATHBERRY DIAGNOSTICS: CURRENTLY_ASSUMED_X outerHTML(trunc)=${JSON.stringify(x.outerHtmlTrunc)}`);
-    x.parentChain.forEach((p, i) => {
-      console.log(
-        `STRATHBERRY DIAGNOSTICS: CURRENTLY_ASSUMED_X parentChain[${i}]: tag=${p.tag} text=${JSON.stringify(
-          p.text
-        )} rectRelative=${JSON.stringify(p.rectRelative)}`
-      );
-    });
-    x.siblings.forEach((s, i) => {
-      console.log(
-        `STRATHBERRY DIAGNOSTICS: CURRENTLY_ASSUMED_X sibling[${i}]: tag=${s.tag} text=${JSON.stringify(
-          s.text
-        )} rectRelative=${JSON.stringify(s.rectRelative)}`
-      );
-    });
-  } else {
-    console.log("STRATHBERRY DIAGNOSTICS: CURRENTLY_ASSUMED_X: none found");
-  }
-
-  for (const point of result.probePoints) {
-    console.log(
-      `STRATHBERRY DIAGNOSTICS: top-right probe point ${point.label} (x,y)=(${point.x.toFixed(1)},${point.y.toFixed(
-        1
-      )})`
-    );
-    console.log(`STRATHBERRY DIAGNOSTICS: elementsFromPoint stack for ${point.label}: ${point.stack.length} elements`);
-    point.stack.forEach((s, i) => {
-      console.log(
-        `STRATHBERRY DIAGNOSTICS:   stack[${i}]: tag=${s.tag} class=${JSON.stringify(s.className)} id=${JSON.stringify(
-          s.id
-        )} role=${JSON.stringify(s.role)} ariaLabel=${JSON.stringify(s.ariaLabel)} title=${JSON.stringify(
-          s.title
-        )} text=${JSON.stringify(s.text)} rectViewport=${JSON.stringify(s.rectViewport)} insideOverlay=${
-          s.insideOverlay
-        } ancestorChainTags=${JSON.stringify(s.ancestorChainTags)}`
-      );
-    });
-  }
-
-  console.log("STRATHBERRY DIAGNOSTICS: END");
-}
-
-/**
- * TEMPORARY, READ-ONLY: collects the DOM inventory above from the
- * confirmed overlay. Never clicks or dispatches events. Intended to be
- * removed once the real close-control DOM structure is confirmed from a
- * live run.
- */
-async function runStrathberryDiagnostics(page: Page): Promise<void> {
-  const result = await page.evaluate(collectStrathberryDomDiagnosticsFn, {
-    overlayAttr: OVERLAY_MARK_ATTR,
-  });
-  logStrathberryDomDiagnostics(result);
 }
 
 // The gate deciding whether the Strathberry-specific fallback above may
@@ -1254,18 +1095,11 @@ export async function confirmUkRegion(page: Page): Promise<RegionResult> {
   // click-target resolution/execution/verification.
   if (!closeControl) {
     if (strathberryFallbackAppliesTo(overlay.matchedPatterns)) {
-      // TEMPORARY DIAGNOSTIC RUN: the previous live run showed the
-      // resolved click target (SVG/path inside a "United States" button)
-      // accepting clicks without ever dismissing the modal. Before
-      // changing ranking/selection logic again, collect a read-only DOM
-      // inventory instead of attempting any click — attemptStrathberryDismissal
-      // (unchanged, still present below) is intentionally NOT called this
-      // run, so the modal is expected to remain visible in the screenshot.
-      console.log("Close control strategy: strathberry-diagnostics-only (no dismissal attempted this run)");
-      await runStrathberryDiagnostics(page);
-      console.log("Dismissal verified: false");
+      console.log("Close control strategy: strathberry-true-panel-fallback");
+      const dismissed = await attemptStrathberryDismissal(page);
+      console.log(`Dismissal verified: ${dismissed}`);
       return {
-        regionStatus: "could-not-confirm",
+        regionStatus: dismissed ? "uk-modal-dismissed" : "could-not-confirm",
         detectedStore,
         detectedCurrency,
       };
